@@ -12,8 +12,11 @@
     Designed to run as SYSTEM via Scheduled Task. No credentials stored.
     Idempotent and rollback-friendly with -WhatIf support.
 
+    Supports automatic CA discovery from Active Directory when -CAConfig is not specified.
+
 .PARAMETER CAConfig
-    Required. CA configuration string (e.g., "CAHOST\CA-NAME")
+    Optional. CA configuration string (e.g., "CAHOST\CA-NAME").
+    If not specified, auto-discovers Enterprise CAs from Active Directory.
 
 .PARAMETER TemplateName
     Certificate template name. Default: "LDAPS"
@@ -45,17 +48,27 @@
 .PARAMETER VerboseLogging
     Enable verbose/trace level logging for detailed troubleshooting
 
+.PARAMETER PreferredCA
+    When multiple CAs are discovered, prefer this CA name (partial match supported).
+    Only used when -CAConfig is not specified.
+
+.EXAMPLE
+    .\Renew-LdapsCert.ps1 -BaseDomain "contoso.com"
+    # Auto-discovers CA from Active Directory
+
 .EXAMPLE
     .\Renew-LdapsCert.ps1 -CAConfig "CA01\Contoso-CA" -BaseDomain "contoso.com"
+    # Uses explicitly specified CA
+
+.EXAMPLE
+    .\Renew-LdapsCert.ps1 -PreferredCA "Issuing" -VerboseLogging
+    # Auto-discovers CA, prefers one with "Issuing" in the name
 
 .EXAMPLE
     .\Renew-LdapsCert.ps1 -CAConfig "CA01\Contoso-CA" -WhatIf -CleanupOld
 
-.EXAMPLE
-    .\Renew-LdapsCert.ps1 -CAConfig "CA01\Contoso-CA" -VerboseLogging
-
 .NOTES
-    Version: 1.1.0
+    Version: 1.2.0
     Author: PKI Automation
     Requires: Windows Server 2016+, PowerShell 5.1+
     Run As: Local SYSTEM via Scheduled Task
@@ -66,13 +79,15 @@
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
+    [Parameter(Mandatory = $false)]
     [string]$CAConfig,
 
     [Parameter(Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
     [string]$TemplateName = "LDAPS",
+
+    [Parameter(Mandatory = $false)]
+    [string]$PreferredCA,
 
     [Parameter(Mandatory = $false)]
     [string]$BaseDomain,
@@ -112,7 +127,7 @@ $script:SAN_OID = "2.5.29.17"
 $script:EKU_OID = "2.5.29.37"
 $script:WORK_DIR = "C:\ProgramData\LdapsCertRenew"
 $script:ExitCode = 0
-$script:ScriptVersion = "1.1.0"
+$script:ScriptVersion = "1.2.0"
 $script:ScriptStartTime = Get-Date
 $script:VerboseEnabled = $VerboseLogging.IsPresent -or $VerbosePreference -eq 'Continue'
 #endregion
@@ -344,7 +359,7 @@ function Get-EnvironmentInfo {
     }
 
     # Network connectivity to CA (parse CA hostname from config)
-    if ($CAConfig -match "^([^\\]+)\\") {
+    if (-not [string]::IsNullOrWhiteSpace($CAConfig) -and $CAConfig -match "^([^\\]+)\\") {
         $caHost = $Matches[1]
         Write-LogVerbose -Message "Testing connectivity to CA host: $caHost" -Level DEBUG
         try {
@@ -369,6 +384,231 @@ function Get-EnvironmentInfo {
             Write-Log -Message "Network test to CA failed: $_" -Level WARN
         }
     }
+    elseif ([string]::IsNullOrWhiteSpace($CAConfig)) {
+        Write-Log -Message "CA not specified - will auto-discover from Active Directory"
+    }
+}
+#endregion
+
+#region CA Auto-Discovery Functions
+function Get-EnterpriseCAs {
+    <#
+    .SYNOPSIS
+        Discovers Enterprise CAs from Active Directory.
+    .DESCRIPTION
+        Queries the Configuration partition for pKIEnrollmentService objects
+        which represent Enterprise CAs in the forest.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$TemplateName
+    )
+
+    Write-LogSubSection -Title "Enterprise CA Discovery"
+    Write-Log -Message "Querying Active Directory for Enterprise CAs..."
+
+    $enterpriseCAs = @()
+
+    try {
+        # Get the configuration naming context
+        $rootDSE = [ADSI]"LDAP://RootDSE"
+        $configNC = $rootDSE.configurationNamingContext.Value
+        Write-LogVerbose -Message "Configuration NC: $configNC" -Level DEBUG
+
+        # Build the path to Enrollment Services
+        $enrollmentServicesPath = "LDAP://CN=Enrollment Services,CN=Public Key Services,CN=Services,$configNC"
+        Write-LogVerbose -Message "Enrollment Services path: $enrollmentServicesPath" -Level DEBUG
+
+        $enrollmentServices = [ADSI]$enrollmentServicesPath
+
+        if ($null -eq $enrollmentServices -or $null -eq $enrollmentServices.Children) {
+            Write-Log -Message "No Enrollment Services container found" -Level WARN
+            return $enterpriseCAs
+        }
+
+        # Enumerate all pKIEnrollmentService objects (Enterprise CAs)
+        foreach ($ca in $enrollmentServices.Children) {
+            if ($ca.SchemaClassName -ne "pKIEnrollmentService") {
+                continue
+            }
+
+            $caName = $ca.cn.Value
+            $dnsHostname = $ca.dNSHostName.Value
+            $caCertificateDN = $ca.cACertificateDN.Value
+            $certificateTemplates = @($ca.certificateTemplates.Value)
+
+            Write-LogVerbose -Message "Found CA: $caName" -Level DEBUG
+            Write-LogVerbose -Message "  DNS Hostname: $dnsHostname" -Level DEBUG
+            Write-LogVerbose -Message "  Certificate DN: $caCertificateDN" -Level DEBUG
+            Write-LogVerbose -Message "  Templates published: $($certificateTemplates.Count)" -Level DEBUG
+
+            # Build CA config string
+            $caConfig = "$dnsHostname\$caName"
+
+            # Check if the required template is published (if specified)
+            $hasTemplate = $true
+            if (-not [string]::IsNullOrWhiteSpace($TemplateName)) {
+                $hasTemplate = $certificateTemplates -contains $TemplateName
+                Write-LogVerbose -Message "  Has template '$TemplateName': $hasTemplate" -Level DEBUG
+            }
+
+            $caInfo = [PSCustomObject]@{
+                Name              = $caName
+                DNSHostName       = $dnsHostname
+                Config            = $caConfig
+                CertificateDN     = $caCertificateDN
+                Templates         = $certificateTemplates
+                HasRequiredTemplate = $hasTemplate
+            }
+
+            $enterpriseCAs += $caInfo
+
+            Write-Log -Message "  Discovered CA: $caConfig"
+            if (-not [string]::IsNullOrWhiteSpace($TemplateName)) {
+                $templateStatus = if ($hasTemplate) { "YES" } else { "NO" }
+                Write-Log -Message "    Template '$TemplateName' published: $templateStatus"
+            }
+        }
+
+        Write-Log -Message "Total Enterprise CAs found: $($enterpriseCAs.Count)"
+
+    }
+    catch {
+        Write-Log -Message "Failed to query Active Directory for CAs: $_" -Level ERROR
+        Write-LogVerbose -Message "Exception type: $($_.Exception.GetType().FullName)" -Level DEBUG
+        Write-LogVerbose -Message "Stack trace: $($_.ScriptStackTrace)" -Level DEBUG
+    }
+
+    return $enterpriseCAs
+}
+
+function Select-CertificateAuthority {
+    <#
+    .SYNOPSIS
+        Selects the appropriate CA from discovered CAs.
+    .DESCRIPTION
+        Selection logic:
+        1. If only one CA exists, use it
+        2. If PreferredCA is specified, prefer matching CA
+        3. If TemplateName specified, prefer CAs with that template
+        4. Otherwise, use the first available CA
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$AvailableCAs,
+
+        [Parameter(Mandatory = $false)]
+        [string]$PreferredCA,
+
+        [Parameter(Mandatory = $false)]
+        [string]$TemplateName
+    )
+
+    Write-Log -Message "Selecting Certificate Authority..."
+
+    if ($AvailableCAs.Count -eq 0) {
+        Write-Log -Message "No Enterprise CAs available for selection" -Level ERROR
+        return $null
+    }
+
+    if ($AvailableCAs.Count -eq 1) {
+        $selected = $AvailableCAs[0]
+        Write-Log -Message "Single CA available - auto-selected: $($selected.Config)"
+        return $selected.Config
+    }
+
+    Write-Log -Message "Multiple CAs available ($($AvailableCAs.Count)) - applying selection criteria..."
+
+    # Filter by template if specified
+    $candidates = $AvailableCAs
+    if (-not [string]::IsNullOrWhiteSpace($TemplateName)) {
+        $withTemplate = $AvailableCAs | Where-Object { $_.HasRequiredTemplate }
+        if ($withTemplate.Count -gt 0) {
+            $candidates = @($withTemplate)
+            Write-Log -Message "  Filtered to $($candidates.Count) CA(s) with template '$TemplateName'"
+        }
+        else {
+            Write-Log -Message "  No CAs have template '$TemplateName' published - using all CAs" -Level WARN
+        }
+    }
+
+    # Apply PreferredCA filter if specified
+    if (-not [string]::IsNullOrWhiteSpace($PreferredCA)) {
+        Write-Log -Message "  Applying preference filter: '$PreferredCA'"
+
+        $preferred = $candidates | Where-Object {
+            $_.Name -like "*$PreferredCA*" -or
+            $_.DNSHostName -like "*$PreferredCA*" -or
+            $_.Config -like "*$PreferredCA*"
+        }
+
+        if ($preferred.Count -gt 0) {
+            $selected = $preferred[0]
+            Write-Log -Message "  Preferred CA matched: $($selected.Config)"
+            return $selected.Config
+        }
+        else {
+            Write-Log -Message "  No CA matched preference '$PreferredCA' - using first available" -Level WARN
+        }
+    }
+
+    # Default to first candidate
+    $selected = $candidates[0]
+    Write-Log -Message "  Selected CA: $($selected.Config)"
+    return $selected.Config
+}
+
+function Resolve-CAConfiguration {
+    <#
+    .SYNOPSIS
+        Resolves the CA configuration - either from parameter or auto-discovery.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$ExplicitCAConfig,
+
+        [Parameter(Mandatory = $false)]
+        [string]$PreferredCA,
+
+        [Parameter(Mandatory = $false)]
+        [string]$TemplateName
+    )
+
+    Write-LogSubSection -Title "CA Configuration Resolution"
+
+    # If explicit CA provided, use it
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitCAConfig)) {
+        Write-Log -Message "Using explicitly specified CA: $ExplicitCAConfig"
+        return $ExplicitCAConfig
+    }
+
+    Write-Log -Message "No CA specified - initiating auto-discovery..."
+
+    # Discover CAs from AD
+    $discoveredCAs = Get-EnterpriseCAs -TemplateName $TemplateName
+
+    if ($discoveredCAs.Count -eq 0) {
+        Write-Log -Message "No Enterprise CAs discovered in Active Directory" -Level ERROR
+        Write-Log -Message "Please specify -CAConfig parameter explicitly" -Level ERROR
+        throw "CA auto-discovery failed: No Enterprise CAs found in Active Directory"
+    }
+
+    # Select appropriate CA
+    $selectedCA = Select-CertificateAuthority -AvailableCAs $discoveredCAs `
+        -PreferredCA $PreferredCA -TemplateName $TemplateName
+
+    if ([string]::IsNullOrWhiteSpace($selectedCA)) {
+        Write-Log -Message "Failed to select a Certificate Authority" -Level ERROR
+        throw "CA auto-discovery failed: Could not select an appropriate CA"
+    }
+
+    Write-Log -Message ""
+    Write-Log -Message "AUTO-DISCOVERED CA: $selectedCA"
+
+    return $selectedCA
 }
 #endregion
 
@@ -1650,7 +1890,8 @@ function Invoke-LdapsCertRenewal {
     # Log all input parameters
     Write-Log -Message ""
     Write-Log -Message "Input Parameters:"
-    Write-Log -Message "  CAConfig: $CAConfig"
+    Write-Log -Message "  CAConfig: $(if ([string]::IsNullOrWhiteSpace($CAConfig)) { '(auto-discover)' } else { $CAConfig })"
+    Write-Log -Message "  PreferredCA: $(if ([string]::IsNullOrWhiteSpace($PreferredCA)) { '(not specified)' } else { $PreferredCA })"
     Write-Log -Message "  TemplateName: $TemplateName"
     Write-Log -Message "  BaseDomain: $(if ([string]::IsNullOrWhiteSpace($BaseDomain)) { '(not specified)' } else { $BaseDomain })"
     Write-Log -Message "  IncludeShortNameSan: $IncludeShortNameSan"
@@ -1663,6 +1904,10 @@ function Invoke-LdapsCertRenewal {
     try {
         # Get environment info
         Get-EnvironmentInfo
+
+        # Resolve CA configuration (explicit or auto-discover)
+        $resolvedCAConfig = Resolve-CAConfiguration -ExplicitCAConfig $CAConfig `
+            -PreferredCA $PreferredCA -TemplateName $TemplateName
 
         # Get DC identity
         $dcIdentity = Get-DcIdentity
@@ -1705,7 +1950,7 @@ function Invoke-LdapsCertRenewal {
         }
 
         # Perform enrollment
-        $enrollResult = Request-LdapsCertificate -CAConfig $CAConfig -TemplateName $TemplateName `
+        $enrollResult = Request-LdapsCertificate -CAConfig $resolvedCAConfig -TemplateName $TemplateName `
             -DcFqdn $dcIdentity.FQDN -DcHostname $dcIdentity.Hostname `
             -BaseDomain $BaseDomain -IncludeShortName $IncludeShortNameSan `
             -KeySize $MinKeySize -HashAlgorithm $HashAlgorithm

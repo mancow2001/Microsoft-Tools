@@ -14,6 +14,7 @@ This solution provides scheduled, unattended renewal of LDAPS certificates on Do
 
 ### Key Features
 
+- **CA Auto-Discovery** - Automatically discovers Enterprise CAs from Active Directory
 - Runs as SYSTEM via Windows Scheduled Task (no stored credentials)
 - Idempotent - safe to run repeatedly
 - Supports `-WhatIf` for preview/testing
@@ -100,18 +101,27 @@ Before scheduling, test the script manually with `-WhatIf`:
 # Navigate to script location
 cd C:\Scripts\LDAPS-Renewal
 
-# Test with WhatIf (no changes made)
+# Test with auto-discovery (recommended)
+.\Renew-LdapsCert.ps1 -WhatIf
+
+# Or test with explicit CA
 .\Renew-LdapsCert.ps1 -CAConfig "CA01\Contoso-CA" -WhatIf
 
 # If successful, run without WhatIf
-.\Renew-LdapsCert.ps1 -CAConfig "CA01\Contoso-CA"
+.\Renew-LdapsCert.ps1
 ```
 
 ### Step 3: Install Scheduled Task
 
 ```powershell
-# Basic installation
-.\Install-LdapsRenewTask.ps1 -CAConfig "CA01\Contoso-CA"
+# Auto-discover CA (simplest)
+.\Install-LdapsRenewTask.ps1 -BaseDomain "contoso.com"
+
+# Auto-discover with preference for specific CA name
+.\Install-LdapsRenewTask.ps1 -PreferredCA "Issuing" -BaseDomain "contoso.com"
+
+# Explicit CA specification
+.\Install-LdapsRenewTask.ps1 -CAConfig "CA01\Contoso-CA" -BaseDomain "contoso.com"
 
 # With all options
 .\Install-LdapsRenewTask.ps1 `
@@ -131,7 +141,8 @@ cd C:\Scripts\LDAPS-Renewal
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `-CAConfig` | Yes | - | CA config string (e.g., "CAHOST\CA-NAME") |
+| `-CAConfig` | No | (auto-discover) | CA config string (e.g., "CAHOST\CA-NAME"). If omitted, auto-discovers from AD |
+| `-PreferredCA` | No | - | When auto-discovering, prefer CA matching this name (partial match) |
 | `-TemplateName` | No | LDAPS | Certificate template name |
 | `-BaseDomain` | No | - | Additional SAN DNS entry for base domain |
 | `-IncludeShortNameSan` | No | $true | Include DC hostname in SAN |
@@ -147,7 +158,8 @@ cd C:\Scripts\LDAPS-Renewal
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `-CAConfig` | Yes | - | CA config string |
+| `-CAConfig` | No | (auto-discover) | CA config string. If omitted, auto-discovers from AD |
+| `-PreferredCA` | No | - | When auto-discovering, prefer CA matching this name |
 | `-TemplateName` | No | LDAPS | Certificate template name |
 | `-BaseDomain` | No | - | Additional SAN DNS entry |
 | `-IncludeShortNameSan` | No | $true | Include hostname in SAN |
@@ -161,6 +173,73 @@ cd C:\Scripts\LDAPS-Renewal
 | `-RandomDelayMinutes` | No | 30 | Random delay to stagger DCs |
 | `-Force` | No | $false | Overwrite existing task |
 | `-Uninstall` | No | $false | Remove the scheduled task |
+
+## CA Auto-Discovery
+
+When `-CAConfig` is not specified, the script automatically discovers Enterprise CAs from Active Directory.
+
+### How It Works
+
+1. **Query AD**: Searches the Configuration partition for `pKIEnrollmentService` objects
+   ```
+   CN=Enrollment Services,CN=Public Key Services,CN=Services,CN=Configuration,DC=domain,DC=com
+   ```
+
+2. **Enumerate CAs**: Lists all Enterprise CAs registered in the forest
+
+3. **Filter by Template**: If `-TemplateName` is specified, prefers CAs that have published that template
+
+4. **Apply Preference**: If `-PreferredCA` is specified, selects CA matching that name
+
+5. **Select CA**: Chooses the best available CA based on criteria
+
+### Selection Logic
+
+| Scenario | Behavior |
+|----------|----------|
+| Single CA in forest | Uses that CA automatically |
+| Multiple CAs, no preference | Uses first available CA with template |
+| Multiple CAs, `-PreferredCA` specified | Uses CA matching preference |
+| No CAs found | Fails with error |
+
+### Usage Examples
+
+```powershell
+# Simplest - auto-discover everything
+.\Renew-LdapsCert.ps1
+
+# Auto-discover, prefer CA with "Issuing" in name
+.\Renew-LdapsCert.ps1 -PreferredCA "Issuing"
+
+# Auto-discover, but filter by template
+.\Renew-LdapsCert.ps1 -TemplateName "LDAPS-Custom"
+
+# Explicit CA (skip auto-discovery)
+.\Renew-LdapsCert.ps1 -CAConfig "CA01\Contoso-Issuing-CA"
+```
+
+### Sample Auto-Discovery Log
+
+```
+[2024-03-15 03:15:22.100] [INFO] --------------------------------------------------
+[2024-03-15 03:15:22.100] [INFO] CA Configuration Resolution
+[2024-03-15 03:15:22.100] [INFO] --------------------------------------------------
+[2024-03-15 03:15:22.101] [INFO] No CA specified - initiating auto-discovery...
+[2024-03-15 03:15:22.150] [INFO] --------------------------------------------------
+[2024-03-15 03:15:22.150] [INFO] Enterprise CA Discovery
+[2024-03-15 03:15:22.150] [INFO] --------------------------------------------------
+[2024-03-15 03:15:22.151] [INFO] Querying Active Directory for Enterprise CAs...
+[2024-03-15 03:15:22.200] [INFO]   Discovered CA: ca01.contoso.com\Contoso-Root-CA
+[2024-03-15 03:15:22.201] [INFO]     Template 'LDAPS' published: NO
+[2024-03-15 03:15:22.210] [INFO]   Discovered CA: ca02.contoso.com\Contoso-Issuing-CA
+[2024-03-15 03:15:22.211] [INFO]     Template 'LDAPS' published: YES
+[2024-03-15 03:15:22.212] [INFO] Total Enterprise CAs found: 2
+[2024-03-15 03:15:22.213] [INFO] Selecting Certificate Authority...
+[2024-03-15 03:15:22.214] [INFO]   Filtered to 1 CA(s) with template 'LDAPS'
+[2024-03-15 03:15:22.215] [INFO]   Selected CA: ca02.contoso.com\Contoso-Issuing-CA
+[2024-03-15 03:15:22.216] [INFO]
+[2024-03-15 03:15:22.217] [INFO] AUTO-DISCOVERED CA: ca02.contoso.com\Contoso-Issuing-CA
+```
 
 ## Initial Bootstrap Scenario
 
@@ -464,6 +543,7 @@ if ($null -eq $task) {
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.2.0 | 2024-03-15 | Added CA auto-discovery from Active Directory, `-PreferredCA` parameter |
 | 1.1.0 | 2024-03-15 | Added verbose logging with DEBUG/TRACE levels, elapsed time tracking, environment discovery |
 | 1.0.0 | 2024-03-15 | Initial release |
 

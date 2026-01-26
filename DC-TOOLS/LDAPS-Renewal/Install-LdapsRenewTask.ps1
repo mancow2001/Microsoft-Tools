@@ -5,9 +5,15 @@
 .DESCRIPTION
     Creates a scheduled task that runs Renew-LdapsCert.ps1 under SYSTEM context.
     Supports customizable schedule, failure recovery, and idempotent updates.
+    Supports CA auto-discovery when -CAConfig is not specified.
 
 .PARAMETER CAConfig
-    Required. CA configuration string (e.g., "CAHOST\CA-NAME")
+    Optional. CA configuration string (e.g., "CAHOST\CA-NAME").
+    If not specified, the script will auto-discover from Active Directory.
+
+.PARAMETER PreferredCA
+    When multiple CAs are discovered, prefer CA matching this name (partial match).
+    Only used when -CAConfig is not specified.
 
 .PARAMETER TemplateName
     Certificate template name. Default: "LDAPS"
@@ -46,16 +52,25 @@
     Remove the scheduled task instead of installing
 
 .EXAMPLE
-    .\Install-LdapsRenewTask.ps1 -CAConfig "CA01\Contoso-CA" -BaseDomain "contoso.com"
+    .\Install-LdapsRenewTask.ps1 -BaseDomain "contoso.com"
+    # Auto-discovers CA from Active Directory
 
 .EXAMPLE
-    .\Install-LdapsRenewTask.ps1 -CAConfig "CA01\Contoso-CA" -TriggerDay Monday -TriggerTime "02:00"
+    .\Install-LdapsRenewTask.ps1 -CAConfig "CA01\Contoso-CA" -BaseDomain "contoso.com"
+    # Uses explicitly specified CA
+
+.EXAMPLE
+    .\Install-LdapsRenewTask.ps1 -PreferredCA "Issuing" -BaseDomain "contoso.com"
+    # Auto-discovers CA, prefers one with "Issuing" in name
+
+.EXAMPLE
+    .\Install-LdapsRenewTask.ps1 -TriggerDay Monday -TriggerTime "02:00"
 
 .EXAMPLE
     .\Install-LdapsRenewTask.ps1 -Uninstall
 
 .NOTES
-    Version: 1.0.0
+    Version: 1.2.0
     Author: PKI Automation
     Requires: Windows Server 2016+, PowerShell 5.1+, Administrator privileges
 #>
@@ -65,9 +80,11 @@
 
 [CmdletBinding(DefaultParameterSetName = 'Install')]
 param(
-    [Parameter(ParameterSetName = 'Install', Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
+    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
     [string]$CAConfig,
+
+    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [string]$PreferredCA,
 
     [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
@@ -208,11 +225,20 @@ if ($null -ne $existingTask -and -not $Force) {
 
 # Build script arguments
 $scriptArgs = @(
-    "-CAConfig `"$CAConfig`""
     "-TemplateName `"$TemplateName`""
     "-IncludeShortNameSan `$$IncludeShortNameSan"
     "-RenewWithinDays $RenewWithinDays"
 )
+
+# Add CAConfig if explicitly specified
+if (-not [string]::IsNullOrWhiteSpace($CAConfig)) {
+    $scriptArgs += "-CAConfig `"$CAConfig`""
+}
+
+# Add PreferredCA if specified (for auto-discovery)
+if (-not [string]::IsNullOrWhiteSpace($PreferredCA)) {
+    $scriptArgs += "-PreferredCA `"$PreferredCA`""
+}
 
 if (-not [string]::IsNullOrWhiteSpace($BaseDomain)) {
     $scriptArgs += "-BaseDomain `"$BaseDomain`""
@@ -303,7 +329,8 @@ Write-Host "Execution Limit:   15 minutes"
 Write-Host "Restart on Fail:   Yes (3 attempts, 5 min interval)"
 Write-Host ""
 Write-Host "Script Parameters:"
-Write-Host "  CA Config:       $CAConfig"
+Write-Host "  CA Config:       $(if ([string]::IsNullOrWhiteSpace($CAConfig)) { '(auto-discover from AD)' } else { $CAConfig })"
+Write-Host "  Preferred CA:    $(if ([string]::IsNullOrWhiteSpace($PreferredCA)) { '(not specified)' } else { $PreferredCA })"
 Write-Host "  Template:        $TemplateName"
 Write-Host "  Base Domain:     $(if ([string]::IsNullOrWhiteSpace($BaseDomain)) { '(not configured)' } else { $BaseDomain })"
 Write-Host "  Include Short:   $IncludeShortNameSan"
