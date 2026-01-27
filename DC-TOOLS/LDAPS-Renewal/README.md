@@ -153,6 +153,8 @@ cd C:\Scripts\LDAPS-Renewal
 | `-MinKeySize` | No | 2048 | RSA key size |
 | `-HashAlgorithm` | No | sha256 | Hash algorithm (sha256/sha384/sha512) |
 | `-VerboseLogging` | No | $false | Enable DEBUG/TRACE level logging for troubleshooting |
+| `-StartupDelayMaxSeconds` | No | 0 | Max random delay (0-3600s) before execution. Recommended: 300-900 for multi-DC |
+| `-UseHostnameBasedDelay` | No | $false | Use deterministic hostname-based delay instead of random |
 
 ### Install-LdapsRenewTask.ps1 Parameters
 
@@ -170,7 +172,9 @@ cd C:\Scripts\LDAPS-Renewal
 | `-TaskName` | No | LDAPS Cert Renewal | Scheduled task name |
 | `-TriggerDay` | No | Sunday | Day of week for weekly trigger |
 | `-TriggerTime` | No | 03:15 | Time for trigger (HH:mm) |
-| `-RandomDelayMinutes` | No | 30 | Random delay to stagger DCs |
+| `-RandomDelayMinutes` | No | 30 | Random delay to stagger DCs (task trigger level) |
+| `-StartupDelayMaxSeconds` | No | 0 | Script-level startup delay (0-3600s). Recommended: 300-900 |
+| `-UseHostnameBasedDelay` | No | $false | Use deterministic hostname-based delay |
 | `-Force` | No | $false | Overwrite existing task |
 | `-Uninstall` | No | $false | Remove the scheduled task |
 
@@ -239,6 +243,89 @@ When `-CAConfig` is not specified, the script automatically discovers Enterprise
 [2024-03-15 03:15:22.215] [INFO]   Selected CA: ca02.contoso.com\Contoso-Issuing-CA
 [2024-03-15 03:15:22.216] [INFO]
 [2024-03-15 03:15:22.217] [INFO] AUTO-DISCOVERED CA: ca02.contoso.com\Contoso-Issuing-CA
+```
+
+## Execution Staggering (Multi-DC)
+
+When deploying to multiple Domain Controllers, it's important to prevent all DCs from hitting the CA simultaneously. The solution provides two layers of staggering:
+
+### Layer 1: Task Trigger Delay (RandomDelayMinutes)
+
+This is a Windows Scheduled Task feature that adds a random delay when the task is triggered:
+
+```powershell
+.\Install-LdapsRenewTask.ps1 -RandomDelayMinutes 30
+```
+
+- Applied by Windows Task Scheduler at trigger time
+- Different random delay each run
+- Default: 30 minutes
+
+### Layer 2: Script Startup Delay (StartupDelayMaxSeconds)
+
+This is a script-level delay that occurs after the task starts but before certificate operations begin:
+
+```powershell
+# Random delay (different each run)
+.\Renew-LdapsCert.ps1 -StartupDelayMaxSeconds 600
+
+# Hostname-based delay (consistent per DC)
+.\Renew-LdapsCert.ps1 -StartupDelayMaxSeconds 900 -UseHostnameBasedDelay
+```
+
+### Delay Types
+
+| Type | Parameter | Behavior | Best For |
+|------|-----------|----------|----------|
+| **Random** | `-StartupDelayMaxSeconds 600` | Different delay each run (0 to max) | General load distribution |
+| **Hostname-based** | `-StartupDelayMaxSeconds 900 -UseHostnameBasedDelay` | Same delay for same DC every run | Predictable scheduling |
+
+### How Hostname-Based Delay Works
+
+The hostname-based delay uses a SHA256 hash of the computer name to generate a deterministic delay:
+
+1. Takes the DC hostname (e.g., `DC01`)
+2. Computes SHA256 hash
+3. Converts first 4 bytes to integer
+4. Applies modulo to fit within max delay range
+
+This ensures:
+- Same DC always gets the same delay
+- Different DCs get evenly distributed delays
+- Delays are predictable for troubleshooting
+
+### Recommended Configuration
+
+For environments with multiple DCs:
+
+```powershell
+# Install with both delay layers
+.\Install-LdapsRenewTask.ps1 `
+    -BaseDomain "contoso.com" `
+    -RandomDelayMinutes 30 `
+    -StartupDelayMaxSeconds 600 `
+    -UseHostnameBasedDelay
+```
+
+| DC Count | Recommended StartupDelayMaxSeconds |
+|----------|-----------------------------------|
+| 2-5 DCs | 300 (5 minutes) |
+| 5-10 DCs | 600 (10 minutes) |
+| 10-20 DCs | 900 (15 minutes) |
+| 20+ DCs | 1800 (30 minutes) |
+
+### Sample Delay Log Output
+
+```
+[2024-03-15 03:15:22.100] [INFO] ======================================================================
+[2024-03-15 03:15:22.100] [INFO] Startup Delay
+[2024-03-15 03:15:22.100] [INFO] ======================================================================
+[2024-03-15 03:15:22.101] [INFO] Delay type: Hostname-based (deterministic)
+[2024-03-15 03:15:22.102] [INFO] Hostname: DC01
+[2024-03-15 03:15:22.103] [INFO] Computed delay: 247 seconds (of 600 max)
+[2024-03-15 03:15:22.104] [INFO] Waiting 247 seconds before proceeding...
+[2024-03-15 03:15:22.105] [INFO] Estimated start time: 2024-03-15 03:19:29
+[2024-03-19 03:19:29.200] [INFO] Startup delay completed
 ```
 
 ## Initial Bootstrap Scenario
@@ -513,36 +600,425 @@ If the old certificate was cleaned up:
 | `C:\ProgramData\LdapsCertRenew\ldaps_request_*.req` | Generated CSR files (retained for audit) |
 | `C:\ProgramData\LdapsCertRenew\ldaps_cert_*.cer` | Issued certificates (retained for audit) |
 
-## Multi-DC Deployment
+## Multi-DC Deployment via Group Policy
 
-For environments with multiple Domain Controllers:
+This section provides detailed instructions for deploying the LDAPS certificate renewal solution to all Domain Controllers using Group Policy.
 
-1. **Deploy via Group Policy Preferences** - Copy scripts to all DCs
-2. **Stagger Execution** - Use `-RandomDelayMinutes` to prevent CA overload
-3. **Monitor Centrally** - Forward logs to SIEM or central logging
+### Overview
 
-Example GPO deployment script:
+There are two recommended approaches:
+
+| Method | Best For | Complexity |
+|--------|----------|------------|
+| **GPO Scheduled Task** | Most environments | Medium |
+| **GPO Startup Script** | Simple deployment | Low |
+
+Both methods ensure consistent deployment across all DCs with automatic remediation if scripts are removed.
+
+### Prerequisites
+
+1. **SYSVOL Location**: Store scripts in SYSVOL for replication
+   ```
+   \\domain.com\SYSVOL\domain.com\scripts\LDAPS-Renewal\
+   ├── Renew-LdapsCert.ps1
+   ├── Install-LdapsRenewTask.ps1
+   └── Deploy-LdapsCertRenewal.ps1  (optional bootstrap script)
+   ```
+
+2. **GPO Targeting**: Create a GPO linked to the **Domain Controllers** OU
+
+3. **Permissions**: The GPO must allow Domain Controllers to read SYSVOL
+
+---
+
+### Method 1: GPO Scheduled Task (Recommended)
+
+This method uses Group Policy Preferences to create a scheduled task directly on all DCs.
+
+#### Step 1: Create the GPO
+
+```
+1. Open Group Policy Management Console (gpmc.msc)
+2. Right-click "Domain Controllers" OU → Create a GPO
+3. Name it: "LDAPS Certificate Auto-Renewal"
+4. Right-click the GPO → Edit
+```
+
+#### Step 2: Deploy Scripts via File Preferences
+
+```
+Navigate to:
+  Computer Configuration
+    → Preferences
+      → Windows Settings
+        → Files
+
+Create two file entries:
+```
+
+**File 1: Renew-LdapsCert.ps1**
+| Setting | Value |
+|---------|-------|
+| Action | Replace |
+| Source | `\\%USERDNSDOMAIN%\SYSVOL\%USERDNSDOMAIN%\scripts\LDAPS-Renewal\Renew-LdapsCert.ps1` |
+| Destination | `C:\Scripts\LDAPS-Renewal\Renew-LdapsCert.ps1` |
+
+**File 2: Install-LdapsRenewTask.ps1**
+| Setting | Value |
+|---------|-------|
+| Action | Replace |
+| Source | `\\%USERDNSDOMAIN%\SYSVOL\%USERDNSDOMAIN%\scripts\LDAPS-Renewal\Install-LdapsRenewTask.ps1` |
+| Destination | `C:\Scripts\LDAPS-Renewal\Install-LdapsRenewTask.ps1` |
+
+#### Step 3: Create Scheduled Task via GPO Preferences
+
+```
+Navigate to:
+  Computer Configuration
+    → Preferences
+      → Control Panel Settings
+        → Scheduled Tasks
+
+Right-click → New → Scheduled Task (At least Windows 7)
+```
+
+**General Tab:**
+| Setting | Value |
+|---------|-------|
+| Action | Replace |
+| Name | LDAPS Cert Renewal |
+| User account | NT AUTHORITY\SYSTEM |
+| Run whether user is logged on or not | ✓ |
+| Run with highest privileges | ✓ |
+| Configure for | Windows Server 2016 |
+
+**Triggers Tab:**
+| Setting | Value |
+|---------|-------|
+| Begin the task | On a schedule |
+| Settings | Weekly |
+| Start | 3:15:00 AM |
+| Days | Sunday (or your preference) |
+| Enabled | ✓ |
+
+Click "Advanced settings":
+| Setting | Value |
+|---------|-------|
+| Random delay | 30 minutes |
+| Enabled | ✓ |
+
+**Actions Tab:**
+| Setting | Value |
+|---------|-------|
+| Action | Start a program |
+| Program/script | `powershell.exe` |
+| Arguments | `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\Scripts\LDAPS-Renewal\Renew-LdapsCert.ps1" -TemplateName "LDAPS" -BaseDomain "contoso.com"` |
+
+> **Note**: Omit `-CAConfig` to use auto-discovery, or specify explicitly if needed.
+
+**Settings Tab:**
+| Setting | Value |
+|---------|-------|
+| Allow task to be run on demand | ✓ |
+| Run task as soon as possible after a scheduled start is missed | ✓ |
+| If the task fails, restart every | 5 minutes |
+| Attempt to restart up to | 3 times |
+| Stop the task if it runs longer than | 15 minutes |
+| If the running task does not end when requested, force it to stop | ✓ |
+
+#### Step 4: Apply and Test
 
 ```powershell
-# Run on each DC (via startup script or scheduled task)
-$deployPath = "C:\Scripts\LDAPS-Renewal"
+# Force GPO update on a test DC
+gpupdate /force
 
-if (-not (Test-Path "$deployPath\Renew-LdapsCert.ps1")) {
-    # Copy from SYSVOL or network share
-    Copy-Item "\\domain.com\SYSVOL\domain.com\scripts\LDAPS-Renewal\*" -Destination $deployPath -Recurse
+# Verify task was created
+Get-ScheduledTask -TaskName "LDAPS Cert Renewal"
+
+# Run task manually to test
+Start-ScheduledTask -TaskName "LDAPS Cert Renewal"
+
+# Check results
+Get-Content "C:\ProgramData\LdapsCertRenew\renew.log" -Tail 50
+```
+
+---
+
+### Method 2: GPO Startup Script
+
+This method uses a PowerShell startup script to deploy and configure the solution.
+
+#### Step 1: Create Bootstrap Script
+
+Save as `Deploy-LdapsCertRenewal.ps1` in SYSVOL:
+
+```powershell
+<#
+.SYNOPSIS
+    GPO Startup Script - Deploys LDAPS Certificate Renewal Solution
+.DESCRIPTION
+    Copies scripts from SYSVOL and installs scheduled task.
+    Safe to run multiple times (idempotent).
+#>
+
+$ErrorActionPreference = "Stop"
+$LogFile = "C:\ProgramData\LdapsCertRenew\gpo-deploy.log"
+
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "[$timestamp] $Message"
+    Add-Content -Path $LogFile -Value $entry -Force
+    Write-Host $entry
 }
 
-# Install task if not exists
-$task = Get-ScheduledTask -TaskName "LDAPS Cert Renewal" -ErrorAction SilentlyContinue
-if ($null -eq $task) {
-    & "$deployPath\Install-LdapsRenewTask.ps1" -CAConfig "CA01\Contoso-CA" -Force
+try {
+    # Ensure log directory exists
+    $logDir = Split-Path $LogFile -Parent
+    if (-not (Test-Path $logDir)) {
+        New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+    }
+
+    Write-Log "=========================================="
+    Write-Log "LDAPS Cert Renewal - GPO Deployment Start"
+    Write-Log "=========================================="
+    Write-Log "Computer: $env:COMPUTERNAME"
+
+    # Configuration
+    $deployPath = "C:\Scripts\LDAPS-Renewal"
+    $domain = $env:USERDNSDOMAIN
+    $sourcePath = "\\$domain\SYSVOL\$domain\scripts\LDAPS-Renewal"
+
+    # Task configuration - MODIFY THESE AS NEEDED
+    $taskParams = @{
+        TemplateName            = "LDAPS"
+        BaseDomain              = "contoso.com"   # Change to your domain
+        RenewWithinDays         = 45
+        TriggerDay              = "Sunday"
+        TriggerTime             = "03:15"
+        RandomDelayMinutes      = 30
+        StartupDelayMaxSeconds  = 600             # Script-level staggering
+        UseHostnameBasedDelay   = $true           # Deterministic delay per DC
+        # PreferredCA           = "Issuing"       # Uncomment to prefer specific CA
+        # CAConfig              = "CA01\Contoso-CA"  # Uncomment for explicit CA
+    }
+
+    # Create deployment directory
+    if (-not (Test-Path $deployPath)) {
+        Write-Log "Creating directory: $deployPath"
+        New-Item -Path $deployPath -ItemType Directory -Force | Out-Null
+    }
+
+    # Copy scripts from SYSVOL
+    Write-Log "Source: $sourcePath"
+    Write-Log "Destination: $deployPath"
+
+    $scripts = @("Renew-LdapsCert.ps1", "Install-LdapsRenewTask.ps1")
+    foreach ($script in $scripts) {
+        $src = Join-Path $sourcePath $script
+        $dst = Join-Path $deployPath $script
+
+        if (Test-Path $src) {
+            Copy-Item -Path $src -Destination $dst -Force
+            Write-Log "Copied: $script"
+        }
+        else {
+            Write-Log "ERROR: Source not found: $src"
+            throw "Required script not found: $src"
+        }
+    }
+
+    # Check if task needs to be created/updated
+    $existingTask = Get-ScheduledTask -TaskName "LDAPS Cert Renewal" -ErrorAction SilentlyContinue
+
+    if ($null -eq $existingTask) {
+        Write-Log "Scheduled task not found - creating..."
+
+        # Build argument string
+        $installScript = Join-Path $deployPath "Install-LdapsRenewTask.ps1"
+        $argList = @("-Force")
+
+        foreach ($key in $taskParams.Keys) {
+            $value = $taskParams[$key]
+            if ($value -is [switch] -or $value -is [bool]) {
+                if ($value) { $argList += "-$key" }
+            }
+            else {
+                $argList += "-$key `"$value`""
+            }
+        }
+
+        $arguments = $argList -join " "
+        Write-Log "Running: $installScript $arguments"
+
+        & $installScript @taskParams -Force
+
+        Write-Log "Scheduled task created successfully"
+    }
+    else {
+        Write-Log "Scheduled task already exists - skipping creation"
+
+        # Optionally verify task is enabled
+        if ($existingTask.State -ne "Ready") {
+            Write-Log "WARNING: Task state is $($existingTask.State), enabling..."
+            Enable-ScheduledTask -TaskName "LDAPS Cert Renewal"
+        }
+    }
+
+    Write-Log "=========================================="
+    Write-Log "GPO Deployment completed successfully"
+    Write-Log "=========================================="
 }
+catch {
+    Write-Log "FATAL ERROR: $_"
+    Write-Log $_.ScriptStackTrace
+    exit 1
+}
+```
+
+#### Step 2: Configure GPO Startup Script
+
+```
+1. Open Group Policy Management Console (gpmc.msc)
+2. Edit your "LDAPS Certificate Auto-Renewal" GPO
+3. Navigate to:
+   Computer Configuration
+     → Policies
+       → Windows Settings
+         → Scripts (Startup/Shutdown)
+           → Startup
+
+4. Click "PowerShell Scripts" tab
+5. Click "Add"
+6. Script Name: \\domain.com\SYSVOL\domain.com\scripts\LDAPS-Renewal\Deploy-LdapsCertRenewal.ps1
+7. Click OK
+```
+
+**Script Execution Settings:**
+```
+Navigate to:
+  Computer Configuration
+    → Administrative Templates
+      → System
+        → Scripts
+
+Configure:
+  "Run Windows PowerShell scripts first" = Enabled
+```
+
+#### Step 3: Test Deployment
+
+```powershell
+# Force GPO update and reboot to trigger startup script
+gpupdate /force
+Restart-Computer -Force
+
+# After reboot, verify deployment
+Get-ScheduledTask -TaskName "LDAPS Cert Renewal"
+Get-Content "C:\ProgramData\LdapsCertRenew\gpo-deploy.log"
+```
+
+---
+
+### GPO Deployment Best Practices
+
+#### 1. Stagger Execution Across DCs
+
+Use multiple layers of delay to prevent all DCs hitting the CA simultaneously:
+
+```powershell
+# Task trigger delay (Windows Scheduler)
+-RandomDelayMinutes 30
+
+# Script startup delay (recommended for large environments)
+-StartupDelayMaxSeconds 600 -UseHostnameBasedDelay
+```
+
+This provides two levels of staggering:
+- Task trigger: 0-30 minutes random delay when task fires
+- Script startup: 0-600 seconds deterministic delay based on hostname
+
+For GPO Scheduled Task, add the startup delay parameters to the Arguments:
+```
+-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\Scripts\LDAPS-Renewal\Renew-LdapsCert.ps1" -TemplateName "LDAPS" -BaseDomain "contoso.com" -StartupDelayMaxSeconds 600 -UseHostnameBasedDelay
+```
+
+#### 2. Use WMI Filtering (Optional)
+
+To target only Domain Controllers:
+
+```
+WMI Filter: SELECT * FROM Win32_ComputerSystem WHERE DomainRole = 4 OR DomainRole = 5
+```
+
+- DomainRole 4 = Backup Domain Controller
+- DomainRole 5 = Primary Domain Controller
+
+#### 3. Security Filtering
+
+Ensure only Domain Controllers can read and apply the GPO:
+
+```
+Security Filtering:
+  - Remove "Authenticated Users"
+  - Add "Domain Controllers" with Read and Apply permissions
+```
+
+#### 4. Monitoring and Alerting
+
+Forward logs to central monitoring:
+
+```powershell
+# Example: Forward to Windows Event Log
+$log = Get-Content "C:\ProgramData\LdapsCertRenew\renew.log" -Tail 100
+if ($log -match "\[ERROR\]") {
+    Write-EventLog -LogName Application -Source "LDAPS Renewal" -EventId 1001 -EntryType Error -Message ($log -join "`n")
+}
+```
+
+#### 5. Validate GPO Application
+
+```powershell
+# Check GPO application on a DC
+gpresult /r /scope:computer
+
+# Verify scheduled task
+Get-ScheduledTask -TaskName "LDAPS Cert Renewal" | Format-List *
+
+# Check recent task runs
+Get-ScheduledTaskInfo -TaskName "LDAPS Cert Renewal"
+```
+
+---
+
+### Troubleshooting GPO Deployment
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Task not created | GPO not applied | Run `gpupdate /force`, check `gpresult /r` |
+| Scripts not copied | SYSVOL access issue | Verify DFS replication, check permissions |
+| Task runs but fails | Script path wrong | Verify `C:\Scripts\LDAPS-Renewal\` exists |
+| CA not found | Auto-discovery failed | Check AD connectivity, use explicit `-CAConfig` |
+| Permission denied | SYSTEM can't access CA | Verify Domain Controllers have Enroll permission |
+
+**Debug GPO Issues:**
+```powershell
+# Check GPO application
+gpresult /h C:\temp\gpresult.html
+Start-Process C:\temp\gpresult.html
+
+# Check event logs for GPO errors
+Get-WinEvent -LogName "Microsoft-Windows-GroupPolicy/Operational" -MaxEvents 50
+
+# Verify SYSVOL accessibility
+Test-Path "\\$env:USERDNSDOMAIN\SYSVOL\$env:USERDNSDOMAIN\scripts\LDAPS-Renewal\Renew-LdapsCert.ps1"
 ```
 
 ## Version History
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.3.0 | 2024-03-15 | Added execution staggering with `-StartupDelayMaxSeconds` and `-UseHostnameBasedDelay` parameters |
 | 1.2.0 | 2024-03-15 | Added CA auto-discovery from Active Directory, `-PreferredCA` parameter |
 | 1.1.0 | 2024-03-15 | Added verbose logging with DEBUG/TRACE levels, elapsed time tracking, environment discovery |
 | 1.0.0 | 2024-03-15 | Initial release |

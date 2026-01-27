@@ -52,9 +52,27 @@
     When multiple CAs are discovered, prefer this CA name (partial match supported).
     Only used when -CAConfig is not specified.
 
+.PARAMETER StartupDelayMaxSeconds
+    Maximum random delay in seconds before script execution begins.
+    Helps prevent all DCs from hitting the CA simultaneously.
+    Default: 0 (no delay). Recommended for multi-DC: 300-900 seconds.
+
+.PARAMETER UseHostnameBasedDelay
+    Instead of random delay, use a deterministic delay based on hostname hash.
+    Ensures the same DC always gets the same delay, evenly distributed.
+    Requires -StartupDelayMaxSeconds to be set.
+
 .EXAMPLE
     .\Renew-LdapsCert.ps1 -BaseDomain "contoso.com"
     # Auto-discovers CA from Active Directory
+
+.EXAMPLE
+    .\Renew-LdapsCert.ps1 -StartupDelayMaxSeconds 600
+    # Random delay 0-600 seconds before execution
+
+.EXAMPLE
+    .\Renew-LdapsCert.ps1 -StartupDelayMaxSeconds 900 -UseHostnameBasedDelay
+    # Deterministic delay based on hostname (same delay each run)
 
 .EXAMPLE
     .\Renew-LdapsCert.ps1 -CAConfig "CA01\Contoso-CA" -BaseDomain "contoso.com"
@@ -68,7 +86,7 @@
     .\Renew-LdapsCert.ps1 -CAConfig "CA01\Contoso-CA" -WhatIf -CleanupOld
 
 .NOTES
-    Version: 1.2.0
+    Version: 1.3.0
     Author: PKI Automation
     Requires: Windows Server 2016+, PowerShell 5.1+
     Run As: Local SYSTEM via Scheduled Task
@@ -115,7 +133,14 @@ param(
     [string]$HashAlgorithm = "sha256",
 
     [Parameter(Mandatory = $false)]
-    [switch]$VerboseLogging
+    [switch]$VerboseLogging,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 3600)]
+    [int]$StartupDelayMaxSeconds = 0,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$UseHostnameBasedDelay
 )
 
 Set-StrictMode -Version Latest
@@ -127,7 +152,7 @@ $script:SAN_OID = "2.5.29.17"
 $script:EKU_OID = "2.5.29.37"
 $script:WORK_DIR = "C:\ProgramData\LdapsCertRenew"
 $script:ExitCode = 0
-$script:ScriptVersion = "1.2.0"
+$script:ScriptVersion = "1.3.0"
 $script:ScriptStartTime = Get-Date
 $script:VerboseEnabled = $VerboseLogging.IsPresent -or $VerbosePreference -eq 'Continue'
 #endregion
@@ -273,6 +298,105 @@ function Write-LogObject {
         $Object.PSObject.Properties | ForEach-Object {
             Write-LogVerbose -Message "  $($_.Name) = $($_.Value)" -Level TRACE
         }
+    }
+}
+#endregion
+
+#region Startup Delay Functions
+function Get-HostnameBasedDelay {
+    <#
+    .SYNOPSIS
+        Calculates a deterministic delay based on hostname hash.
+    .DESCRIPTION
+        Uses a hash of the hostname to generate a consistent delay value.
+        The same hostname always gets the same delay, ensuring predictable
+        but distributed execution times across multiple DCs.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$MaxDelaySeconds
+    )
+
+    $hostname = $env:COMPUTERNAME
+
+    # Create a hash of the hostname
+    $stringBytes = [System.Text.Encoding]::UTF8.GetBytes($hostname)
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    $hashBytes = $hasher.ComputeHash($stringBytes)
+
+    # Use first 4 bytes as an integer
+    $hashInt = [System.BitConverter]::ToUInt32($hashBytes, 0)
+
+    # Calculate delay as a percentage of max
+    $delay = [int]($hashInt % ($MaxDelaySeconds + 1))
+
+    return $delay
+}
+
+function Invoke-StartupDelay {
+    <#
+    .SYNOPSIS
+        Implements startup delay to stagger execution across multiple DCs.
+    .DESCRIPTION
+        Waits for a random or hostname-based delay before proceeding.
+        This prevents all DCs from hitting the CA simultaneously.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$MaxDelaySeconds,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$UseHostnameBased
+    )
+
+    if ($MaxDelaySeconds -le 0) {
+        Write-LogVerbose -Message "Startup delay: disabled (MaxDelaySeconds=0)" -Level DEBUG
+        return
+    }
+
+    Write-LogSubSection -Title "Startup Delay"
+
+    $delaySeconds = 0
+
+    if ($UseHostnameBased) {
+        $delaySeconds = Get-HostnameBasedDelay -MaxDelaySeconds $MaxDelaySeconds
+        Write-Log -Message "Delay mode: Hostname-based (deterministic)"
+        Write-Log -Message "Hostname: $env:COMPUTERNAME"
+        Write-Log -Message "Calculated delay: $delaySeconds seconds (max: $MaxDelaySeconds)"
+    }
+    else {
+        $delaySeconds = Get-Random -Minimum 0 -Maximum ($MaxDelaySeconds + 1)
+        Write-Log -Message "Delay mode: Random"
+        Write-Log -Message "Random delay: $delaySeconds seconds (max: $MaxDelaySeconds)"
+    }
+
+    if ($delaySeconds -gt 0) {
+        $delayEnd = (Get-Date).AddSeconds($delaySeconds)
+        Write-Log -Message "Waiting until: $($delayEnd.ToString('yyyy-MM-dd HH:mm:ss'))"
+        Write-Log -Message "Starting delay..."
+
+        # Show progress for long delays
+        $progressInterval = [math]::Max(30, [int]($delaySeconds / 10))
+        $elapsed = 0
+
+        while ($elapsed -lt $delaySeconds) {
+            $remaining = $delaySeconds - $elapsed
+            $sleepTime = [math]::Min($progressInterval, $remaining)
+
+            Start-Sleep -Seconds $sleepTime
+            $elapsed += $sleepTime
+
+            if ($elapsed -lt $delaySeconds) {
+                Write-Log -Message "  Delay progress: $elapsed / $delaySeconds seconds ($remaining seconds remaining)"
+            }
+        }
+
+        Write-Log -Message "Delay complete - proceeding with execution"
+    }
+    else {
+        Write-Log -Message "Delay: 0 seconds - proceeding immediately"
     }
 }
 #endregion
@@ -1900,6 +2024,13 @@ function Invoke-LdapsCertRenewal {
     Write-Log -Message "  CleanupOld: $CleanupOld"
     Write-Log -Message "  MinKeySize: $MinKeySize"
     Write-Log -Message "  HashAlgorithm: $HashAlgorithm"
+    Write-Log -Message "  StartupDelayMaxSeconds: $StartupDelayMaxSeconds"
+    Write-Log -Message "  UseHostnameBasedDelay: $UseHostnameBasedDelay"
+
+    # Apply startup delay to stagger execution across DCs
+    if ($StartupDelayMaxSeconds -gt 0) {
+        Invoke-StartupDelay -MaxDelaySeconds $StartupDelayMaxSeconds -UseHostnameBased:$UseHostnameBasedDelay
+    }
 
     try {
         # Get environment info

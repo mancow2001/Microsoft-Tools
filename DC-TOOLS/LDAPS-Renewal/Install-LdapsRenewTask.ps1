@@ -45,6 +45,15 @@
 .PARAMETER RandomDelayMinutes
     Random delay to add to trigger. Default: 30
 
+.PARAMETER StartupDelayMaxSeconds
+    Maximum startup delay in seconds for the renewal script.
+    Helps stagger execution across DCs. Default: 0 (no delay).
+    Recommended for multi-DC: 300-900 seconds.
+
+.PARAMETER UseHostnameBasedDelay
+    Use deterministic hostname-based delay instead of random.
+    Same DC always gets the same delay. Requires StartupDelayMaxSeconds.
+
 .PARAMETER Force
     Overwrite existing task without prompting
 
@@ -67,10 +76,18 @@
     .\Install-LdapsRenewTask.ps1 -TriggerDay Monday -TriggerTime "02:00"
 
 .EXAMPLE
+    .\Install-LdapsRenewTask.ps1 -StartupDelayMaxSeconds 600
+    # Adds random 0-600 second delay before script runs
+
+.EXAMPLE
+    .\Install-LdapsRenewTask.ps1 -StartupDelayMaxSeconds 900 -UseHostnameBasedDelay
+    # Deterministic delay based on hostname (consistent per DC)
+
+.EXAMPLE
     .\Install-LdapsRenewTask.ps1 -Uninstall
 
 .NOTES
-    Version: 1.2.0
+    Version: 1.3.0
     Author: PKI Automation
     Requires: Windows Server 2016+, PowerShell 5.1+, Administrator privileges
 #>
@@ -125,6 +142,13 @@ param(
     [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
     [ValidateRange(0, 120)]
     [int]$RandomDelayMinutes = 30,
+
+    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [ValidateRange(0, 3600)]
+    [int]$StartupDelayMaxSeconds = 0,
+
+    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [switch]$UseHostnameBasedDelay,
 
     [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
     [switch]$Force,
@@ -252,6 +276,14 @@ if ($VerboseLogging) {
     $scriptArgs += "-VerboseLogging"
 }
 
+if ($StartupDelayMaxSeconds -gt 0) {
+    $scriptArgs += "-StartupDelayMaxSeconds $StartupDelayMaxSeconds"
+}
+
+if ($UseHostnameBasedDelay) {
+    $scriptArgs += "-UseHostnameBasedDelay"
+}
+
 $argumentString = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`" " + ($scriptArgs -join " ")
 
 Write-Status "PowerShell arguments: $argumentString"
@@ -337,6 +369,7 @@ Write-Host "  Include Short:   $IncludeShortNameSan"
 Write-Host "  Renew Threshold: $RenewWithinDays days"
 Write-Host "  Cleanup Old:     $CleanupOld"
 Write-Host "  Verbose Logging: $VerboseLogging"
+Write-Host "  Startup Delay:   $(if ($StartupDelayMaxSeconds -gt 0) { "${StartupDelayMaxSeconds}s $(if ($UseHostnameBasedDelay) { '(hostname-based)' } else { '(random)' })" } else { '(none)' })"
 Write-Host ""
 Write-Host "=" * 60
 
