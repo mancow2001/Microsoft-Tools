@@ -606,14 +606,7 @@ This section provides detailed instructions for deploying the LDAPS certificate 
 
 ### Overview
 
-There are two recommended approaches:
-
-| Method | Best For | Complexity |
-|--------|----------|------------|
-| **GPO Scheduled Task** | Most environments | Medium |
-| **GPO Startup Script** | Simple deployment | Low |
-
-Both methods ensure consistent deployment across all DCs with automatic remediation if scripts are removed.
+This method uses Group Policy Preferences to deploy scripts and create a scheduled task directly on all Domain Controllers. It ensures consistent deployment with automatic remediation if scripts are removed.
 
 ### Prerequisites
 
@@ -621,8 +614,7 @@ Both methods ensure consistent deployment across all DCs with automatic remediat
    ```
    \\domain.com\SYSVOL\domain.com\scripts\LDAPS-Renewal\
    ├── Renew-LdapsCert.ps1
-   ├── Install-LdapsRenewTask.ps1
-   └── Deploy-LdapsCertRenewal.ps1  (optional bootstrap script)
+   └── Install-LdapsRenewTask.ps1
    ```
 
 2. **GPO Targeting**: Create a GPO linked to the **Domain Controllers** OU
@@ -631,11 +623,7 @@ Both methods ensure consistent deployment across all DCs with automatic remediat
 
 ---
 
-### Method 1: GPO Scheduled Task (Recommended)
-
-This method uses Group Policy Preferences to create a scheduled task directly on all DCs.
-
-#### Step 1: Create the GPO
+### Step 1: Create the GPO
 
 ```
 1. Open Group Policy Management Console (gpmc.msc)
@@ -644,7 +632,7 @@ This method uses Group Policy Preferences to create a scheduled task directly on
 4. Right-click the GPO → Edit
 ```
 
-#### Step 2: Deploy Scripts via File Preferences
+### Step 2: Deploy Scripts via File Preferences
 
 ```
 Navigate to:
@@ -670,7 +658,7 @@ Create two file entries:
 | Source | `\\%USERDNSDOMAIN%\SYSVOL\%USERDNSDOMAIN%\scripts\LDAPS-Renewal\Install-LdapsRenewTask.ps1` |
 | Destination | `C:\Scripts\LDAPS-Renewal\Install-LdapsRenewTask.ps1` |
 
-#### Step 3: Create Scheduled Task via GPO Preferences
+### Step 3: Create Scheduled Task via GPO Preferences
 
 ```
 Navigate to:
@@ -726,7 +714,7 @@ Click "Advanced settings":
 | Stop the task if it runs longer than | 15 minutes |
 | If the running task does not end when requested, force it to stop | ✓ |
 
-#### Step 4: Apply and Test
+### Step 4: Apply and Test
 
 ```powershell
 # Force GPO update on a test DC
@@ -744,183 +732,7 @@ Get-Content "C:\ProgramData\LdapsCertRenew\renew.log" -Tail 50
 
 ---
 
-### Method 2: GPO Startup Script
-
-This method uses a PowerShell startup script to deploy and configure the solution.
-
-#### Step 1: Create Bootstrap Script
-
-Save as `Deploy-LdapsCertRenewal.ps1` in SYSVOL:
-
-```powershell
-<#
-.SYNOPSIS
-    GPO Startup Script - Deploys LDAPS Certificate Renewal Solution
-.DESCRIPTION
-    Copies scripts from SYSVOL and installs scheduled task.
-    Safe to run multiple times (idempotent).
-#>
-
-$ErrorActionPreference = "Stop"
-$LogFile = "C:\ProgramData\LdapsCertRenew\gpo-deploy.log"
-
-function Write-Log {
-    param([string]$Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $entry = "[$timestamp] $Message"
-    Add-Content -Path $LogFile -Value $entry -Force
-    Write-Host $entry
-}
-
-try {
-    # Ensure log directory exists
-    $logDir = Split-Path $LogFile -Parent
-    if (-not (Test-Path $logDir)) {
-        New-Item -Path $logDir -ItemType Directory -Force | Out-Null
-    }
-
-    Write-Log "=========================================="
-    Write-Log "LDAPS Cert Renewal - GPO Deployment Start"
-    Write-Log "=========================================="
-    Write-Log "Computer: $env:COMPUTERNAME"
-
-    # Configuration
-    $deployPath = "C:\Scripts\LDAPS-Renewal"
-    $domain = $env:USERDNSDOMAIN
-    $sourcePath = "\\$domain\SYSVOL\$domain\scripts\LDAPS-Renewal"
-
-    # Task configuration - MODIFY THESE AS NEEDED
-    $taskParams = @{
-        TemplateName            = "LDAPS"
-        BaseDomain              = "contoso.com"   # Change to your domain
-        RenewWithinDays         = 45
-        TriggerDay              = "Sunday"
-        TriggerTime             = "03:15"
-        RandomDelayMinutes      = 30
-        StartupDelayMaxSeconds  = 600             # Script-level staggering
-        UseHostnameBasedDelay   = $true           # Deterministic delay per DC
-        # PreferredCA           = "Issuing"       # Uncomment to prefer specific CA
-        # CAConfig              = "CA01\Contoso-CA"  # Uncomment for explicit CA
-    }
-
-    # Create deployment directory
-    if (-not (Test-Path $deployPath)) {
-        Write-Log "Creating directory: $deployPath"
-        New-Item -Path $deployPath -ItemType Directory -Force | Out-Null
-    }
-
-    # Copy scripts from SYSVOL
-    Write-Log "Source: $sourcePath"
-    Write-Log "Destination: $deployPath"
-
-    $scripts = @("Renew-LdapsCert.ps1", "Install-LdapsRenewTask.ps1")
-    foreach ($script in $scripts) {
-        $src = Join-Path $sourcePath $script
-        $dst = Join-Path $deployPath $script
-
-        if (Test-Path $src) {
-            Copy-Item -Path $src -Destination $dst -Force
-            Write-Log "Copied: $script"
-        }
-        else {
-            Write-Log "ERROR: Source not found: $src"
-            throw "Required script not found: $src"
-        }
-    }
-
-    # Check if task needs to be created/updated
-    $existingTask = Get-ScheduledTask -TaskName "LDAPS Cert Renewal" -ErrorAction SilentlyContinue
-
-    if ($null -eq $existingTask) {
-        Write-Log "Scheduled task not found - creating..."
-
-        # Build argument string
-        $installScript = Join-Path $deployPath "Install-LdapsRenewTask.ps1"
-        $argList = @("-Force")
-
-        foreach ($key in $taskParams.Keys) {
-            $value = $taskParams[$key]
-            if ($value -is [switch] -or $value -is [bool]) {
-                if ($value) { $argList += "-$key" }
-            }
-            else {
-                $argList += "-$key `"$value`""
-            }
-        }
-
-        $arguments = $argList -join " "
-        Write-Log "Running: $installScript $arguments"
-
-        & $installScript @taskParams -Force
-
-        Write-Log "Scheduled task created successfully"
-    }
-    else {
-        Write-Log "Scheduled task already exists - skipping creation"
-
-        # Optionally verify task is enabled
-        if ($existingTask.State -ne "Ready") {
-            Write-Log "WARNING: Task state is $($existingTask.State), enabling..."
-            Enable-ScheduledTask -TaskName "LDAPS Cert Renewal"
-        }
-    }
-
-    Write-Log "=========================================="
-    Write-Log "GPO Deployment completed successfully"
-    Write-Log "=========================================="
-}
-catch {
-    Write-Log "FATAL ERROR: $_"
-    Write-Log $_.ScriptStackTrace
-    exit 1
-}
-```
-
-#### Step 2: Configure GPO Startup Script
-
-```
-1. Open Group Policy Management Console (gpmc.msc)
-2. Edit your "LDAPS Certificate Auto-Renewal" GPO
-3. Navigate to:
-   Computer Configuration
-     → Policies
-       → Windows Settings
-         → Scripts (Startup/Shutdown)
-           → Startup
-
-4. Click "PowerShell Scripts" tab
-5. Click "Add"
-6. Script Name: \\domain.com\SYSVOL\domain.com\scripts\LDAPS-Renewal\Deploy-LdapsCertRenewal.ps1
-7. Click OK
-```
-
-**Script Execution Settings:**
-```
-Navigate to:
-  Computer Configuration
-    → Administrative Templates
-      → System
-        → Scripts
-
-Configure:
-  "Run Windows PowerShell scripts first" = Enabled
-```
-
-#### Step 3: Test Deployment
-
-```powershell
-# Force GPO update and reboot to trigger startup script
-gpupdate /force
-Restart-Computer -Force
-
-# After reboot, verify deployment
-Get-ScheduledTask -TaskName "LDAPS Cert Renewal"
-Get-Content "C:\ProgramData\LdapsCertRenew\gpo-deploy.log"
-```
-
----
-
-### GPO Deployment Best Practices
+### Best Practices
 
 #### 1. Stagger Execution Across DCs
 
