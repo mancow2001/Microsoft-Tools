@@ -81,7 +81,7 @@
     # Configures staggered execution for multi-DC environments
 
 .NOTES
-    Version: 1.5.1
+    Version: 1.5.2
     Author: PKI Automation
     Requires: Windows Server 2012 R2+, PowerShell 4.0+, Administrator privileges
 
@@ -92,6 +92,8 @@
 
     v1.5.1 - Fixed scheduled task argument passing for PowerShell 4.0 compatibility
              (uses -Command instead of -File for proper boolean parsing)
+    v1.5.2 - Fixed RandomDelay format for cross-version compatibility (2012 R2 - 2022)
+             (auto-detects required format using try/catch fallback)
 #>
 
 #Requires -Version 4.0
@@ -158,7 +160,7 @@ $ErrorActionPreference = "Stop"
 #region Constants
 $script:InstallPath = Join-Path -Path $env:ProgramFiles -ChildPath "LDAPS-Renewal"
 $script:RenewalScriptName = "Renew-LdapsCert.ps1"
-$script:Version = "1.5.1"
+$script:Version = "1.5.2"
 #endregion
 
 #region Helper Functions
@@ -308,9 +310,20 @@ $triggerTimeObj = [DateTime]::ParseExact($TriggerTime, "HH:mm", $null)
 $dayOfWeek = Get-DaysOfWeekFlag -DayName $TriggerDay
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $dayOfWeek -At $triggerTimeObj
 
-# Add random delay if specified (use TimeSpan for 2012 R2 compatibility)
+# Add random delay if specified
 if ($RandomDelayMinutes -gt 0) {
-    $trigger.RandomDelay = (New-TimeSpan -Minutes $RandomDelayMinutes)
+    # Different Windows versions require different formats for RandomDelay:
+    # - Server 2012 R2: TimeSpan object
+    # - Server 2016/2019/2022: ISO 8601 duration string (e.g., "PT30M")
+    # Use try/catch to handle both cases since OS version detection is unreliable
+    try {
+        # Try ISO 8601 format first (Server 2016+)
+        $trigger.RandomDelay = "PT${RandomDelayMinutes}M"
+    }
+    catch {
+        # Fall back to TimeSpan for older versions (Server 2012 R2)
+        $trigger.RandomDelay = (New-TimeSpan -Minutes $RandomDelayMinutes)
+    }
 }
 
 # Create principal (SYSTEM, highest privileges)
