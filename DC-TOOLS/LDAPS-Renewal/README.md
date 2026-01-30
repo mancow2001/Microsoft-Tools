@@ -15,6 +15,8 @@ This solution provides scheduled, unattended renewal of LDAPS certificates on Do
 ### Key Features
 
 - **CA Auto-Discovery** - Automatically discovers Enterprise CAs from Active Directory
+- **Auto BaseDomain SAN** - Automatically includes AD domain name in certificate SAN
+- **Wide OS Support** - Windows Server 2012 R2 through Server 2025
 - Runs as SYSTEM via Windows Scheduled Task (no stored credentials)
 - Idempotent - safe to run repeatedly
 - Supports `-WhatIf` for preview/testing
@@ -63,8 +65,8 @@ This solution provides scheduled, unattended renewal of LDAPS certificates on Do
 
 ### Domain Controller Requirements
 
-- Windows Server 2016 or later
-- PowerShell 5.1 or later
+- Windows Server 2012 R2 or later
+- PowerShell 4.0 or later
 - Administrator/SYSTEM access
 - Network connectivity to Enterprise CA
 - `certreq.exe` available (built into Windows)
@@ -74,54 +76,52 @@ This solution provides scheduled, unattended renewal of LDAPS certificates on Do
 | File | Purpose |
 |------|---------|
 | `Renew-LdapsCert.ps1` | Main certificate renewal script |
-| `Install-LdapsRenewTask.ps1` | Scheduled task installer |
-| `README.md` | This documentation |
+| `Install-LdapsRenewTask.ps1` | Installer - deploys to Program Files and creates scheduled task |
+| `Uninstall-LdapsRenewTask.ps1` | Uninstaller - removes scheduled task and installed files |
+| `README.md` | Technical documentation |
+| `ADMIN-GUIDE.md` | System Administrator deployment guide |
 
 ## Installation
 
-### Step 1: Deploy Scripts
+The installer automatically deploys scripts to `C:\Program Files\LDAPS-Renewal` and creates the scheduled task.
 
-Copy both `.ps1` files to a secure location on each Domain Controller:
+### Step 1: Download Scripts
 
-```powershell
-# Recommended location
-$deployPath = "C:\Scripts\LDAPS-Renewal"
-New-Item -Path $deployPath -ItemType Directory -Force
+Download both installer scripts to a temporary location on the Domain Controller:
+- `Install-LdapsRenewTask.ps1`
+- `Renew-LdapsCert.ps1`
 
-# Copy files (from your deployment source)
-Copy-Item -Path ".\Renew-LdapsCert.ps1" -Destination $deployPath
-Copy-Item -Path ".\Install-LdapsRenewTask.ps1" -Destination $deployPath
-```
+### Step 2: Test Manual Execution (Optional)
 
-### Step 2: Test Manual Execution
-
-Before scheduling, test the script manually with `-WhatIf`:
+Before installing, you can test the renewal script manually with `-WhatIf`:
 
 ```powershell
-# Navigate to script location
-cd C:\Scripts\LDAPS-Renewal
-
 # Test with auto-discovery (recommended)
 .\Renew-LdapsCert.ps1 -WhatIf
 
 # Or test with explicit CA
 .\Renew-LdapsCert.ps1 -CAConfig "CA01\Contoso-CA" -WhatIf
-
-# If successful, run without WhatIf
-.\Renew-LdapsCert.ps1
 ```
 
-### Step 3: Install Scheduled Task
+### Step 3: Run Installer
+
+The installer will:
+1. Create `C:\Program Files\LDAPS-Renewal` directory
+2. Copy `Renew-LdapsCert.ps1` to the installation directory
+3. Create a scheduled task pointing to the installed script
 
 ```powershell
-# Auto-discover CA (simplest)
-.\Install-LdapsRenewTask.ps1 -BaseDomain "contoso.com"
+# Simplest - auto-discover CA and auto-include AD domain as SAN
+.\Install-LdapsRenewTask.ps1
 
 # Auto-discover with preference for specific CA name
-.\Install-LdapsRenewTask.ps1 -PreferredCA "Issuing" -BaseDomain "contoso.com"
+.\Install-LdapsRenewTask.ps1 -PreferredCA "Issuing"
 
 # Explicit CA specification
-.\Install-LdapsRenewTask.ps1 -CAConfig "CA01\Contoso-CA" -BaseDomain "contoso.com"
+.\Install-LdapsRenewTask.ps1 -CAConfig "CA01\Contoso-CA"
+
+# With custom base domain (overrides auto-detection)
+.\Install-LdapsRenewTask.ps1 -BaseDomain "contoso.com"
 
 # With all options
 .\Install-LdapsRenewTask.ps1 `
@@ -135,6 +135,21 @@ cd C:\Scripts\LDAPS-Renewal
     -TriggerTime "03:15"
 ```
 
+### Uninstallation
+
+Use the separate uninstall script to remove the solution:
+
+```powershell
+# Standard uninstall (preserves logs)
+.\Uninstall-LdapsRenewTask.ps1
+
+# Complete removal including logs
+.\Uninstall-LdapsRenewTask.ps1 -RemoveLogs
+
+# Silent uninstall (no prompts)
+.\Uninstall-LdapsRenewTask.ps1 -Force
+```
+
 ## Configuration Reference
 
 ### Renew-LdapsCert.ps1 Parameters
@@ -144,7 +159,7 @@ cd C:\Scripts\LDAPS-Renewal
 | `-CAConfig` | No | (auto-discover) | CA config string (e.g., "CAHOST\CA-NAME"). If omitted, auto-discovers from AD |
 | `-PreferredCA` | No | - | When auto-discovering, prefer CA matching this name (partial match) |
 | `-TemplateName` | No | LDAPS | Certificate template name |
-| `-BaseDomain` | No | - | Additional SAN DNS entry for base domain |
+| `-BaseDomain` | No | (AD domain) | Additional SAN DNS entry. If omitted, auto-includes the AD domain name |
 | `-IncludeShortNameSan` | No | $true | Include DC hostname in SAN |
 | `-RenewWithinDays` | No | 45 | Days before expiration to trigger renewal |
 | `-LogPath` | No | C:\ProgramData\LdapsCertRenew\renew.log | Log file path |
@@ -155,6 +170,7 @@ cd C:\Scripts\LDAPS-Renewal
 | `-VerboseLogging` | No | $false | Enable DEBUG/TRACE level logging for troubleshooting |
 | `-StartupDelayMaxSeconds` | No | 0 | Max random delay (0-3600s) before execution. Recommended: 300-900 for multi-DC |
 | `-UseHostnameBasedDelay` | No | $false | Use deterministic hostname-based delay instead of random |
+| `-DiagnoseOnly` | No | $false | Run comprehensive diagnostics without making changes |
 
 ### Install-LdapsRenewTask.ps1 Parameters
 
@@ -163,20 +179,39 @@ cd C:\Scripts\LDAPS-Renewal
 | `-CAConfig` | No | (auto-discover) | CA config string. If omitted, auto-discovers from AD |
 | `-PreferredCA` | No | - | When auto-discovering, prefer CA matching this name |
 | `-TemplateName` | No | LDAPS | Certificate template name |
-| `-BaseDomain` | No | - | Additional SAN DNS entry |
+| `-BaseDomain` | No | (AD domain) | Additional SAN DNS entry. If omitted, auto-includes AD domain |
 | `-IncludeShortNameSan` | No | $true | Include hostname in SAN |
 | `-RenewWithinDays` | No | 45 | Renewal threshold in days |
 | `-CleanupOld` | No | $false | Auto-cleanup superseded certs |
 | `-VerboseLogging` | No | $false | Enable verbose logging in scheduled runs |
-| `-ScriptPath` | No | (same directory) | Path to Renew-LdapsCert.ps1 |
 | `-TaskName` | No | LDAPS Cert Renewal | Scheduled task name |
 | `-TriggerDay` | No | Sunday | Day of week for weekly trigger |
 | `-TriggerTime` | No | 03:15 | Time for trigger (HH:mm) |
 | `-RandomDelayMinutes` | No | 30 | Random delay to stagger DCs (task trigger level) |
 | `-StartupDelayMaxSeconds` | No | 0 | Script-level startup delay (0-3600s). Recommended: 300-900 |
 | `-UseHostnameBasedDelay` | No | $false | Use deterministic hostname-based delay |
-| `-Force` | No | $false | Overwrite existing task |
-| `-Uninstall` | No | $false | Remove the scheduled task |
+| `-Force` | No | $false | Overwrite existing installation without prompting |
+
+### Uninstall-LdapsRenewTask.ps1 Parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `-TaskName` | No | LDAPS Cert Renewal | Scheduled task name to remove |
+| `-RemoveLogs` | No | $false | Also remove log directory (C:\ProgramData\LdapsCertRenew) |
+| `-Force` | No | $false | Skip confirmation prompts |
+
+## Automatic Configuration
+
+The script is designed to work with minimal configuration by automatically discovering settings from Active Directory.
+
+### Auto BaseDomain SAN
+
+When `-BaseDomain` is not specified, the script automatically includes the AD domain name (from the DC's domain membership) as a SAN entry. This ensures the certificate works for domain-wide LDAPS queries without manual configuration.
+
+**Example**: On a DC in `contoso.com`, the certificate automatically includes:
+- `dc01.contoso.com` (DC FQDN - always included)
+- `dc01` (hostname - when `-IncludeShortNameSan $true`)
+- `contoso.com` (auto-discovered AD domain)
 
 ## CA Auto-Discovery
 
@@ -225,24 +260,24 @@ When `-CAConfig` is not specified, the script automatically discovers Enterprise
 ### Sample Auto-Discovery Log
 
 ```
-[2024-03-15 03:15:22.100] [INFO] --------------------------------------------------
-[2024-03-15 03:15:22.100] [INFO] CA Configuration Resolution
-[2024-03-15 03:15:22.100] [INFO] --------------------------------------------------
-[2024-03-15 03:15:22.101] [INFO] No CA specified - initiating auto-discovery...
-[2024-03-15 03:15:22.150] [INFO] --------------------------------------------------
-[2024-03-15 03:15:22.150] [INFO] Enterprise CA Discovery
-[2024-03-15 03:15:22.150] [INFO] --------------------------------------------------
-[2024-03-15 03:15:22.151] [INFO] Querying Active Directory for Enterprise CAs...
-[2024-03-15 03:15:22.200] [INFO]   Discovered CA: ca01.contoso.com\Contoso-Root-CA
-[2024-03-15 03:15:22.201] [INFO]     Template 'LDAPS' published: NO
-[2024-03-15 03:15:22.210] [INFO]   Discovered CA: ca02.contoso.com\Contoso-Issuing-CA
-[2024-03-15 03:15:22.211] [INFO]     Template 'LDAPS' published: YES
-[2024-03-15 03:15:22.212] [INFO] Total Enterprise CAs found: 2
-[2024-03-15 03:15:22.213] [INFO] Selecting Certificate Authority...
-[2024-03-15 03:15:22.214] [INFO]   Filtered to 1 CA(s) with template 'LDAPS'
-[2024-03-15 03:15:22.215] [INFO]   Selected CA: ca02.contoso.com\Contoso-Issuing-CA
-[2024-03-15 03:15:22.216] [INFO]
-[2024-03-15 03:15:22.217] [INFO] AUTO-DISCOVERED CA: ca02.contoso.com\Contoso-Issuing-CA
+[2026-01-30 03:15:22.100] [INFO] --------------------------------------------------
+[2026-01-30 03:15:22.100] [INFO] CA Configuration Resolution
+[2026-01-30 03:15:22.100] [INFO] --------------------------------------------------
+[2026-01-30 03:15:22.101] [INFO] No CA specified - initiating auto-discovery...
+[2026-01-30 03:15:22.150] [INFO] --------------------------------------------------
+[2026-01-30 03:15:22.150] [INFO] Enterprise CA Discovery
+[2026-01-30 03:15:22.150] [INFO] --------------------------------------------------
+[2026-01-30 03:15:22.151] [INFO] Querying Active Directory for Enterprise CAs...
+[2026-01-30 03:15:22.200] [INFO]   Discovered CA: ca01.contoso.com\Contoso-Root-CA
+[2026-01-30 03:15:22.201] [INFO]     Template 'LDAPS' published: NO
+[2026-01-30 03:15:22.210] [INFO]   Discovered CA: ca02.contoso.com\Contoso-Issuing-CA
+[2026-01-30 03:15:22.211] [INFO]     Template 'LDAPS' published: YES
+[2026-01-30 03:15:22.212] [INFO] Total Enterprise CAs found: 2
+[2026-01-30 03:15:22.213] [INFO] Selecting Certificate Authority...
+[2026-01-30 03:15:22.214] [INFO]   Filtered to 1 CA(s) with template 'LDAPS'
+[2026-01-30 03:15:22.215] [INFO]   Selected CA: ca02.contoso.com\Contoso-Issuing-CA
+[2026-01-30 03:15:22.216] [INFO]
+[2026-01-30 03:15:22.217] [INFO] AUTO-DISCOVERED CA: ca02.contoso.com\Contoso-Issuing-CA
 ```
 
 ## Execution Staggering (Multi-DC)
@@ -317,15 +352,15 @@ For environments with multiple DCs:
 ### Sample Delay Log Output
 
 ```
-[2024-03-15 03:15:22.100] [INFO] ======================================================================
-[2024-03-15 03:15:22.100] [INFO] Startup Delay
-[2024-03-15 03:15:22.100] [INFO] ======================================================================
-[2024-03-15 03:15:22.101] [INFO] Delay type: Hostname-based (deterministic)
-[2024-03-15 03:15:22.102] [INFO] Hostname: DC01
-[2024-03-15 03:15:22.103] [INFO] Computed delay: 247 seconds (of 600 max)
-[2024-03-15 03:15:22.104] [INFO] Waiting 247 seconds before proceeding...
-[2024-03-15 03:15:22.105] [INFO] Estimated start time: 2024-03-15 03:19:29
-[2024-03-19 03:19:29.200] [INFO] Startup delay completed
+[2026-01-30 03:15:22.100] [INFO] ======================================================================
+[2026-01-30 03:15:22.100] [INFO] Startup Delay
+[2026-01-30 03:15:22.100] [INFO] ======================================================================
+[2026-01-30 03:15:22.101] [INFO] Delay type: Hostname-based (deterministic)
+[2026-01-30 03:15:22.102] [INFO] Hostname: DC01
+[2026-01-30 03:15:22.103] [INFO] Computed delay: 247 seconds (of 600 max)
+[2026-01-30 03:15:22.104] [INFO] Waiting 247 seconds before proceeding...
+[2026-01-30 03:15:22.105] [INFO] Estimated start time: 2026-01-30 03:19:29
+[2026-01-30 03:19:29.200] [INFO] Startup delay completed
 ```
 
 ## Initial Bootstrap Scenario
@@ -342,13 +377,13 @@ When no LDAPS certificate exists (State C), the script performs a full bootstrap
 Example bootstrap log:
 
 ```
-[2024-03-15 03:15:22.456] [INFO] ======================================================================
-[2024-03-15 03:15:22.456] [INFO] Certificate Discovery
-[2024-03-15 03:15:22.456] [INFO] ======================================================================
-[2024-03-15 03:15:22.512] [INFO] Searching for LDAPS candidate certificates...
-[2024-03-15 03:15:22.523] [INFO] DC FQDN: dc01.contoso.com
-[2024-03-15 03:15:22.534] [INFO] Total candidates found: 0
-[2024-03-15 03:15:22.545] [INFO] STATE C: No LDAPS candidate certificates found - bootstrap enrollment required
+[2026-01-30 03:15:22.456] [INFO] ======================================================================
+[2026-01-30 03:15:22.456] [INFO] Certificate Discovery
+[2026-01-30 03:15:22.456] [INFO] ======================================================================
+[2026-01-30 03:15:22.512] [INFO] Searching for LDAPS candidate certificates...
+[2026-01-30 03:15:22.523] [INFO] DC FQDN: dc01.contoso.com
+[2026-01-30 03:15:22.534] [INFO] Total candidates found: 0
+[2026-01-30 03:15:22.545] [INFO] STATE C: No LDAPS candidate certificates found - bootstrap enrollment required
 ```
 
 ## Validation Steps
@@ -460,6 +495,30 @@ certutil -setreg chain\ChainCacheResyncFiletime @now
 3. Ensure "Supply in the request" is selected
 4. Uncheck any options that override SANs
 
+#### Scheduled task runs but no logs created
+
+**Cause**: Script fails silently under SYSTEM context (PowerShell 4.0 strict mode issue)
+
+**Diagnosis**:
+```powershell
+# Check heartbeat file (created even if logging fails)
+Get-Content "C:\ProgramData\LdapsCertRenew\heartbeat.txt"
+
+# Check Event Log for errors
+Get-EventLog -LogName Application -Source "LDAPS-Renewal" -Newest 5 -ErrorAction SilentlyContinue
+
+# Run diagnostics
+.\Renew-LdapsCert.ps1 -DiagnoseOnly
+```
+
+**Solution**:
+1. Ensure you're using version 1.5.2 or later
+2. Reinstall with the updated `Install-LdapsRenewTask.ps1` (uses `-Command` instead of `-File`)
+3. Verify the scheduled task arguments use `-Command` not `-File`:
+   ```powershell
+   (Get-ScheduledTask -TaskName "LDAPS Cert Renewal").Actions.Arguments
+   ```
+
 ### Verbose Logging Mode
 
 The script supports comprehensive verbose logging for troubleshooting. Enable it with `-VerboseLogging`:
@@ -496,18 +555,57 @@ The script supports comprehensive verbose logging for troubleshooting. Enable it
 #### Sample Verbose Log Output
 
 ```
-[2024-03-15 03:15:22.456] [+0.000s] [INFO] ======================================================================
-[2024-03-15 03:15:22.456] [+0.000s] [INFO] LDAPS Certificate Renewal - Started
-[2024-03-15 03:15:22.456] [+0.000s] [INFO] ======================================================================
-[2024-03-15 03:15:22.457] [+0.001s] [INFO] Script version: 1.1.0
-[2024-03-15 03:15:22.458] [+0.002s] [INFO] Verbose logging: True
+[2026-01-30 03:15:22.456] [+0.000s] [INFO] ======================================================================
+[2026-01-30 03:15:22.456] [+0.000s] [INFO] LDAPS Certificate Renewal - Started
+[2026-01-30 03:15:22.456] [+0.000s] [INFO] ======================================================================
+[2026-01-30 03:15:22.457] [+0.001s] [INFO] Script version: 1.5.2
+[2026-01-30 03:15:22.458] [+0.002s] [INFO] Verbose logging: True
 ...
-[2024-03-15 03:15:22.512] [+0.056s] [DEBUG] [1/5] Evaluating certificate: ABC123DEF456...
-[2024-03-15 03:15:22.513] [+0.057s] [DEBUG]   Certificate Details:
-[2024-03-15 03:15:22.514] [+0.058s] [DEBUG]     Thumbprint: ABC123DEF456...
-[2024-03-15 03:15:22.515] [+0.059s] [DEBUG]     Subject: CN=dc01.contoso.com
-[2024-03-15 03:15:22.516] [+0.060s] [TRACE]     Extensions count: 8
-[2024-03-15 03:15:22.517] [+0.061s] [TRACE]       Extension: Enhanced Key Usage (2.5.29.37) Critical=False
+[2026-01-30 03:15:22.512] [+0.056s] [DEBUG] [1/5] Evaluating certificate: ABC123DEF456...
+[2026-01-30 03:15:22.513] [+0.057s] [DEBUG]   Certificate Details:
+[2026-01-30 03:15:22.514] [+0.058s] [DEBUG]     Thumbprint: ABC123DEF456...
+[2026-01-30 03:15:22.515] [+0.059s] [DEBUG]     Subject: CN=dc01.contoso.com
+[2026-01-30 03:15:22.516] [+0.060s] [TRACE]     Extensions count: 8
+[2026-01-30 03:15:22.517] [+0.061s] [TRACE]       Extension: Enhanced Key Usage (2.5.29.37) Critical=False
+```
+
+### Diagnostic Mode
+
+The script includes a comprehensive diagnostic mode that checks configuration without making changes:
+
+```powershell
+# Run full diagnostics
+.\Renew-LdapsCert.ps1 -DiagnoseOnly
+
+# Check specific template availability
+.\Renew-LdapsCert.ps1 -DiagnoseOnly -TemplateName "LDAPS"
+```
+
+Diagnostic mode checks:
+- Execution context (SYSTEM vs interactive)
+- Path and write permissions
+- Domain Controller status
+- CA discovery and connectivity
+- Template availability on each CA
+- Current LDAPS certificates
+- Scheduled task configuration
+
+This is especially useful for troubleshooting scheduled task issues where no logs are created.
+
+### Heartbeat File
+
+The script creates a heartbeat file (`C:\ProgramData\LdapsCertRenew\heartbeat.txt`) on each run, even if logging fails. Check this file to verify the script is executing:
+
+```powershell
+Get-Content "C:\ProgramData\LdapsCertRenew\heartbeat.txt"
+```
+
+### Event Log Fallback
+
+If file logging fails, errors are written to the Windows Application Event Log under source "LDAPS-Renewal":
+
+```powershell
+Get-EventLog -LogName Application -Source "LDAPS-Renewal" -Newest 10
 ```
 
 ### Debug Mode (Additional Tools)
@@ -542,8 +640,8 @@ certutil -CATemplates -config "CA01\Contoso-CA"
 # Disable task (keeps configuration)
 Disable-ScheduledTask -TaskName "LDAPS Cert Renewal"
 
-# Or remove completely
-.\Install-LdapsRenewTask.ps1 -Uninstall
+# Or remove completely using the uninstall script
+.\Uninstall-LdapsRenewTask.ps1 -Force
 ```
 
 ### Remove Newly Installed Certificate
@@ -594,8 +692,11 @@ If the old certificate was cleaned up:
 
 | Path | Purpose |
 |------|---------|
-| `C:\ProgramData\LdapsCertRenew\` | Working directory |
+| `C:\Program Files\LDAPS-Renewal\` | Installation directory |
+| `C:\Program Files\LDAPS-Renewal\Renew-LdapsCert.ps1` | Installed renewal script |
+| `C:\ProgramData\LdapsCertRenew\` | Working directory for logs and temp files |
 | `C:\ProgramData\LdapsCertRenew\renew.log` | Primary log file |
+| `C:\ProgramData\LdapsCertRenew\heartbeat.txt` | Heartbeat file (updated each run, useful for diagnostics) |
 | `C:\ProgramData\LdapsCertRenew\ldaps_request_*.inf` | Generated INF files (retained for audit) |
 | `C:\ProgramData\LdapsCertRenew\ldaps_request_*.req` | Generated CSR files (retained for audit) |
 | `C:\ProgramData\LdapsCertRenew\ldaps_cert_*.cer` | Issued certificates (retained for audit) |
@@ -678,7 +779,7 @@ Right-click → New → Scheduled Task (At least Windows 7)
 | User account | NT AUTHORITY\SYSTEM |
 | Run whether user is logged on or not | ✓ |
 | Run with highest privileges | ✓ |
-| Configure for | Windows Server 2016 |
+| Configure for | Windows Server 2012 R2 (or later) |
 
 **Triggers Tab:**
 | Setting | Value |
@@ -700,9 +801,9 @@ Click "Advanced settings":
 |---------|-------|
 | Action | Start a program |
 | Program/script | `powershell.exe` |
-| Arguments | `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\Scripts\LDAPS-Renewal\Renew-LdapsCert.ps1" -TemplateName "LDAPS" -BaseDomain "contoso.com"` |
+| Arguments | `-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& 'C:\Scripts\LDAPS-Renewal\Renew-LdapsCert.ps1' -TemplateName 'LDAPS' -BaseDomain 'contoso.com'"` |
 
-> **Note**: Omit `-CAConfig` to use auto-discovery, or specify explicitly if needed.
+> **Note**: Use `-Command` (not `-File`) for proper parameter parsing in PowerShell 4.0. Omit `-CAConfig` to use auto-discovery, or specify explicitly if needed.
 
 **Settings Tab:**
 | Setting | Value |
@@ -830,10 +931,14 @@ Test-Path "\\$env:USERDNSDOMAIN\SYSVOL\$env:USERDNSDOMAIN\scripts\LDAPS-Renewal\
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 1.3.0 | 2024-03-15 | Added execution staggering with `-StartupDelayMaxSeconds` and `-UseHostnameBasedDelay` parameters |
-| 1.2.0 | 2024-03-15 | Added CA auto-discovery from Active Directory, `-PreferredCA` parameter |
-| 1.1.0 | 2024-03-15 | Added verbose logging with DEBUG/TRACE levels, elapsed time tracking, environment discovery |
-| 1.0.0 | 2024-03-15 | Initial release |
+| 1.5.2 | 2026-01 | Fixed nullable datetime parameter for bootstrap scenarios; Additional PS 4.0 strict mode fixes |
+| 1.5.1 | 2026-01 | Fixed scheduled task argument passing (uses `-Command` instead of `-File` for PS 4.0); Added `-DiagnoseOnly` parameter; Added heartbeat file and Event Log fallback for troubleshooting |
+| 1.5.0 | 2025-01 | Installer now deploys to Program Files; Separate Uninstall script; Improved installation experience |
+| 1.4.0 | 2025-01 | Windows Server 2012 R2 compatibility; Auto-include AD domain as BaseDomain SAN when not specified |
+| 1.3.0 | 2024-03 | Added execution staggering with `-StartupDelayMaxSeconds` and `-UseHostnameBasedDelay` parameters |
+| 1.2.0 | 2024-03 | Added CA auto-discovery from Active Directory, `-PreferredCA` parameter |
+| 1.1.0 | 2024-03 | Added verbose logging with DEBUG/TRACE levels, elapsed time tracking, environment discovery |
+| 1.0.0 | 2024-03 | Initial release |
 
 ## License
 

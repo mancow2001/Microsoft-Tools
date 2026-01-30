@@ -1,10 +1,16 @@
 <#
 .SYNOPSIS
-    Installs or updates the LDAPS Certificate Renewal scheduled task.
+    Installs the LDAPS Certificate Renewal solution and scheduled task.
 
 .DESCRIPTION
-    Creates a scheduled task that runs Renew-LdapsCert.ps1 under SYSTEM context.
-    Supports customizable schedule, failure recovery, and idempotent updates.
+    Deploys the LDAPS certificate renewal solution to Program Files and creates
+    a scheduled task that runs under SYSTEM context.
+
+    Installation includes:
+    - Creating C:\Program Files\LDAPS-Renewal directory
+    - Copying Renew-LdapsCert.ps1 to the installation directory
+    - Creating a weekly scheduled task to run the renewal script
+
     Supports CA auto-discovery when -CAConfig is not specified.
 
 .PARAMETER CAConfig
@@ -19,7 +25,8 @@
     Certificate template name. Default: "LDAPS"
 
 .PARAMETER BaseDomain
-    Optional additional SAN DNS entry for base domain
+    Additional SAN DNS entry for base domain.
+    If not specified, the renewal script auto-includes the AD domain name.
 
 .PARAMETER IncludeShortNameSan
     Include DC hostname in SAN. Default: $true
@@ -30,8 +37,8 @@
 .PARAMETER CleanupOld
     Remove superseded certs after successful enrollment
 
-.PARAMETER ScriptPath
-    Path to Renew-LdapsCert.ps1. Default: Same directory as this script
+.PARAMETER VerboseLogging
+    Enable verbose logging in the renewal script
 
 .PARAMETER TaskName
     Name of the scheduled task. Default: "LDAPS Cert Renewal"
@@ -55,110 +62,104 @@
     Same DC always gets the same delay. Requires StartupDelayMaxSeconds.
 
 .PARAMETER Force
-    Overwrite existing task without prompting
+    Overwrite existing installation without prompting
 
-.PARAMETER Uninstall
-    Remove the scheduled task instead of installing
+.EXAMPLE
+    .\Install-LdapsRenewTask.ps1
+    # Auto-discovers CA and AD domain, installs with defaults
 
 .EXAMPLE
     .\Install-LdapsRenewTask.ps1 -BaseDomain "contoso.com"
-    # Auto-discovers CA from Active Directory
+    # Specifies base domain for SAN
 
 .EXAMPLE
-    .\Install-LdapsRenewTask.ps1 -CAConfig "CA01\Contoso-CA" -BaseDomain "contoso.com"
-    # Uses explicitly specified CA
+    .\Install-LdapsRenewTask.ps1 -CAConfig "CA01\Contoso-CA" -Force
+    # Uses explicit CA and overwrites existing installation
 
 .EXAMPLE
-    .\Install-LdapsRenewTask.ps1 -PreferredCA "Issuing" -BaseDomain "contoso.com"
-    # Auto-discovers CA, prefers one with "Issuing" in name
-
-.EXAMPLE
-    .\Install-LdapsRenewTask.ps1 -TriggerDay Monday -TriggerTime "02:00"
-
-.EXAMPLE
-    .\Install-LdapsRenewTask.ps1 -StartupDelayMaxSeconds 600
-    # Adds random 0-600 second delay before script runs
-
-.EXAMPLE
-    .\Install-LdapsRenewTask.ps1 -StartupDelayMaxSeconds 900 -UseHostnameBasedDelay
-    # Deterministic delay based on hostname (consistent per DC)
-
-.EXAMPLE
-    .\Install-LdapsRenewTask.ps1 -Uninstall
+    .\Install-LdapsRenewTask.ps1 -StartupDelayMaxSeconds 600 -UseHostnameBasedDelay
+    # Configures staggered execution for multi-DC environments
 
 .NOTES
-    Version: 1.3.0
+    Version: 1.5.1
     Author: PKI Automation
-    Requires: Windows Server 2016+, PowerShell 5.1+, Administrator privileges
+    Requires: Windows Server 2012 R2+, PowerShell 4.0+, Administrator privileges
+
+    Installation Path: C:\Program Files\LDAPS-Renewal
+    Log Path: C:\ProgramData\LdapsCertRenew
+
+    Use Uninstall-LdapsRenewTask.ps1 to remove the installation.
+
+    v1.5.1 - Fixed scheduled task argument passing for PowerShell 4.0 compatibility
+             (uses -Command instead of -File for proper boolean parsing)
 #>
 
-#Requires -Version 5.1
+#Requires -Version 4.0
 #Requires -RunAsAdministrator
 
-[CmdletBinding(DefaultParameterSetName = 'Install')]
+[CmdletBinding()]
 param(
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [string]$CAConfig,
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [string]$PreferredCA,
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
     [string]$TemplateName = "LDAPS",
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [string]$BaseDomain,
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [bool]$IncludeShortNameSan = $true,
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [ValidateRange(1, 365)]
     [int]$RenewWithinDays = 45,
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [switch]$CleanupOld,
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [switch]$VerboseLogging,
-
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
-    [ValidateNotNullOrEmpty()]
-    [string]$ScriptPath,
 
     [Parameter(Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
     [string]$TaskName = "LDAPS Cert Renewal",
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [ValidateSet("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")]
     [string]$TriggerDay = "Sunday",
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [ValidatePattern("^([01]?[0-9]|2[0-3]):[0-5][0-9]$")]
     [string]$TriggerTime = "03:15",
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [ValidateRange(0, 120)]
     [int]$RandomDelayMinutes = 30,
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [ValidateRange(0, 3600)]
     [int]$StartupDelayMaxSeconds = 0,
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
+    [Parameter(Mandatory = $false)]
     [switch]$UseHostnameBasedDelay,
 
-    [Parameter(ParameterSetName = 'Install', Mandatory = $false)]
-    [switch]$Force,
-
-    [Parameter(ParameterSetName = 'Uninstall', Mandatory = $true)]
-    [switch]$Uninstall
+    [Parameter(Mandatory = $false)]
+    [switch]$Force
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+#region Constants
+$script:InstallPath = Join-Path -Path $env:ProgramFiles -ChildPath "LDAPS-Renewal"
+$script:RenewalScriptName = "Renew-LdapsCert.ps1"
+$script:Version = "1.5.1"
+#endregion
 
 #region Helper Functions
 function Write-Status {
@@ -193,79 +194,88 @@ function Get-DaysOfWeekFlag {
 }
 #endregion
 
-#region Uninstall
-if ($Uninstall) {
-    Write-Status "Uninstalling scheduled task: $TaskName"
+#region Main Installation
+Write-Host ""
+Write-Host "=" * 60
+Write-Host "LDAPS Certificate Renewal - Installation"
+Write-Host "Version: $script:Version"
+Write-Host "=" * 60
+Write-Host ""
 
-    $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Write-Status "Installation path: $script:InstallPath"
+Write-Status "Task name: $TaskName"
 
-    if ($null -eq $existingTask) {
-        Write-Status "Task '$TaskName' does not exist" -Type Warning
-        exit 0
-    }
+# Locate source renewal script (must be in same directory as installer)
+$sourceScriptPath = Join-Path -Path $PSScriptRoot -ChildPath $script:RenewalScriptName
 
-    try {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        Write-Status "Task '$TaskName' removed successfully" -Type Success
-        exit 0
-    }
-    catch {
-        Write-Status "Failed to remove task: $_" -Type Error
-        exit 1
-    }
-}
-#endregion
-
-#region Install
-Write-Status "Installing LDAPS Certificate Renewal Scheduled Task"
-Write-Status "Task Name: $TaskName"
-
-# Determine script path
-if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
-    $ScriptPath = Join-Path -Path $PSScriptRoot -ChildPath "Renew-LdapsCert.ps1"
-}
-
-# Validate script exists
-if (-not (Test-Path -Path $ScriptPath)) {
-    Write-Status "Renewal script not found: $ScriptPath" -Type Error
-    Write-Status "Ensure Renew-LdapsCert.ps1 is in the same directory or specify -ScriptPath" -Type Error
+if (-not (Test-Path -Path $sourceScriptPath)) {
+    Write-Status "Renewal script not found: $sourceScriptPath" -Type Error
+    Write-Status "Ensure $script:RenewalScriptName is in the same directory as this installer" -Type Error
     exit 1
 }
 
-$ScriptPath = (Resolve-Path -Path $ScriptPath).Path
-Write-Status "Script path: $ScriptPath"
+Write-Status "Source script found: $sourceScriptPath"
 
-# Check for existing task
+# Check for existing installation
 $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+$existingInstall = Test-Path -Path $script:InstallPath
 
-if ($null -ne $existingTask -and -not $Force) {
-    Write-Status "Task '$TaskName' already exists. Use -Force to update." -Type Warning
-    $response = Read-Host "Do you want to update the existing task? (Y/N)"
+if (($existingTask -or $existingInstall) -and -not $Force) {
+    Write-Status "Existing installation detected" -Type Warning
+    if ($existingTask) {
+        Write-Status "  - Scheduled task '$TaskName' exists"
+    }
+    if ($existingInstall) {
+        Write-Status "  - Installation directory exists: $script:InstallPath"
+    }
+    Write-Host ""
+    $response = Read-Host "Do you want to update the existing installation? (Y/N)"
     if ($response -notin @('Y', 'y', 'Yes', 'yes')) {
         Write-Status "Installation cancelled" -Type Warning
         exit 0
     }
 }
 
-# Build script arguments
+# Create installation directory
+Write-Status "Creating installation directory..."
+if (-not (Test-Path -Path $script:InstallPath)) {
+    New-Item -Path $script:InstallPath -ItemType Directory -Force | Out-Null
+    Write-Status "Created: $script:InstallPath" -Type Success
+}
+else {
+    Write-Status "Directory already exists: $script:InstallPath"
+}
+
+# Copy renewal script to installation directory
+$destinationScriptPath = Join-Path -Path $script:InstallPath -ChildPath $script:RenewalScriptName
+Write-Status "Copying renewal script..."
+Copy-Item -Path $sourceScriptPath -Destination $destinationScriptPath -Force
+Write-Status "Installed: $destinationScriptPath" -Type Success
+
+# Verify copy succeeded
+if (-not (Test-Path -Path $destinationScriptPath)) {
+    Write-Status "Failed to copy script to installation directory" -Type Error
+    exit 1
+}
+
+# Build script arguments for scheduled task
+# Note: Using -Command instead of -File to ensure proper boolean parsing in PS 4.0
 $scriptArgs = @(
-    "-TemplateName `"$TemplateName`""
-    "-IncludeShortNameSan `$$IncludeShortNameSan"
+    "-TemplateName '$TemplateName'"
+    "-IncludeShortNameSan:`$$IncludeShortNameSan"
     "-RenewWithinDays $RenewWithinDays"
 )
 
-# Add CAConfig if explicitly specified
 if (-not [string]::IsNullOrWhiteSpace($CAConfig)) {
-    $scriptArgs += "-CAConfig `"$CAConfig`""
+    $scriptArgs += "-CAConfig '$CAConfig'"
 }
 
-# Add PreferredCA if specified (for auto-discovery)
 if (-not [string]::IsNullOrWhiteSpace($PreferredCA)) {
-    $scriptArgs += "-PreferredCA `"$PreferredCA`""
+    $scriptArgs += "-PreferredCA '$PreferredCA'"
 }
 
 if (-not [string]::IsNullOrWhiteSpace($BaseDomain)) {
-    $scriptArgs += "-BaseDomain `"$BaseDomain`""
+    $scriptArgs += "-BaseDomain '$BaseDomain'"
 }
 
 if ($CleanupOld) {
@@ -284,30 +294,29 @@ if ($UseHostnameBasedDelay) {
     $scriptArgs += "-UseHostnameBasedDelay"
 }
 
-$argumentString = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`" " + ($scriptArgs -join " ")
+# Build command string using -Command instead of -File for proper boolean/variable parsing
+$scriptCommand = "& '$destinationScriptPath' " + ($scriptArgs -join " ")
+$argumentString = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command `"$scriptCommand`""
 
-Write-Status "PowerShell arguments: $argumentString"
+Write-Status "Configuring scheduled task..."
 
-# Create action
+# Create scheduled task action
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argumentString
 
 # Create trigger (weekly)
 $triggerTimeObj = [DateTime]::ParseExact($TriggerTime, "HH:mm", $null)
 $dayOfWeek = Get-DaysOfWeekFlag -DayName $TriggerDay
-
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $dayOfWeek -At $triggerTimeObj
 
-# Add random delay if specified
+# Add random delay if specified (use TimeSpan for 2012 R2 compatibility)
 if ($RandomDelayMinutes -gt 0) {
-    $trigger.RandomDelay = "PT${RandomDelayMinutes}M"
+    $trigger.RandomDelay = (New-TimeSpan -Minutes $RandomDelayMinutes)
 }
-
-Write-Status "Trigger: Every $TriggerDay at $TriggerTime (random delay: ${RandomDelayMinutes}m)"
 
 # Create principal (SYSTEM, highest privileges)
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
-# Create settings
+# Create settings (2012 R2 compatible)
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -316,60 +325,71 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartCount 3 `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
     -MultipleInstances IgnoreNew `
-    -Priority 7
+    -Priority 7 `
+    -RunOnlyIfNetworkAvailable
 
-# Additional settings not available via New-ScheduledTaskSettingsSet
-$settings.DisallowStartOnRemoteAppSession = $false
-$settings.RunOnlyIfNetworkAvailable = $true
+# Additional settings - only set if property exists (2012 R2 compatibility)
+if ($settings.PSObject.Properties['DisallowStartOnRemoteAppSession']) {
+    $settings.DisallowStartOnRemoteAppSession = $false
+}
 
 # Create or update task
 try {
     if ($null -ne $existingTask) {
-        Write-Status "Updating existing task..."
+        Write-Status "Updating existing scheduled task..."
         Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
     }
     else {
-        Write-Status "Creating new task..."
+        Write-Status "Creating scheduled task..."
         $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings
         Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
     }
 
     # Set task description
-    $taskPath = "\$TaskName"
-    $existingTask = Get-ScheduledTask -TaskName $TaskName
-    $existingTask.Description = "Automated LDAPS certificate renewal for Domain Controller. Manages certificate lifecycle with Enterprise CA."
+    $registeredTask = Get-ScheduledTask -TaskName $TaskName
+    $registeredTask.Description = "Automated LDAPS certificate renewal for Domain Controller. Manages certificate lifecycle with Enterprise CA. Installed by LDAPS-Renewal v$script:Version."
+    Set-ScheduledTask -InputObject $registeredTask | Out-Null
 
-    Set-ScheduledTask -InputObject $existingTask | Out-Null
-
-    Write-Status "Task '$TaskName' installed successfully" -Type Success
+    Write-Status "Scheduled task configured successfully" -Type Success
 }
 catch {
-    Write-Status "Failed to create/update task: $_" -Type Error
+    Write-Status "Failed to configure scheduled task: $_" -Type Error
     exit 1
 }
 
 # Display summary
 Write-Host ""
 Write-Host "=" * 60
-Write-Host "Scheduled Task Configuration Summary"
+Write-Host "Installation Summary"
 Write-Host "=" * 60
-Write-Host "Task Name:         $TaskName"
-Write-Host "Run As:            SYSTEM"
-Write-Host "Trigger:           Weekly on $TriggerDay at $TriggerTime"
-Write-Host "Random Delay:      $RandomDelayMinutes minutes"
-Write-Host "Execution Limit:   15 minutes"
-Write-Host "Restart on Fail:   Yes (3 attempts, 5 min interval)"
 Write-Host ""
-Write-Host "Script Parameters:"
+Write-Host "Installation Directory:"
+Write-Host "  $script:InstallPath"
+Write-Host ""
+Write-Host "Installed Files:"
+Write-Host "  $destinationScriptPath"
+Write-Host ""
+Write-Host "Scheduled Task:"
+Write-Host "  Name:            $TaskName"
+Write-Host "  Run As:          SYSTEM"
+Write-Host "  Trigger:         Weekly on $TriggerDay at $TriggerTime"
+Write-Host "  Random Delay:    $RandomDelayMinutes minutes"
+Write-Host "  Execution Limit: 15 minutes"
+Write-Host "  Restart on Fail: Yes (3 attempts, 5 min interval)"
+Write-Host ""
+Write-Host "Script Configuration:"
 Write-Host "  CA Config:       $(if ([string]::IsNullOrWhiteSpace($CAConfig)) { '(auto-discover from AD)' } else { $CAConfig })"
 Write-Host "  Preferred CA:    $(if ([string]::IsNullOrWhiteSpace($PreferredCA)) { '(not specified)' } else { $PreferredCA })"
 Write-Host "  Template:        $TemplateName"
-Write-Host "  Base Domain:     $(if ([string]::IsNullOrWhiteSpace($BaseDomain)) { '(not configured)' } else { $BaseDomain })"
+Write-Host "  Base Domain:     $(if ([string]::IsNullOrWhiteSpace($BaseDomain)) { '(auto-detect from AD)' } else { $BaseDomain })"
 Write-Host "  Include Short:   $IncludeShortNameSan"
 Write-Host "  Renew Threshold: $RenewWithinDays days"
 Write-Host "  Cleanup Old:     $CleanupOld"
 Write-Host "  Verbose Logging: $VerboseLogging"
 Write-Host "  Startup Delay:   $(if ($StartupDelayMaxSeconds -gt 0) { "${StartupDelayMaxSeconds}s $(if ($UseHostnameBasedDelay) { '(hostname-based)' } else { '(random)' })" } else { '(none)' })"
+Write-Host ""
+Write-Host "Log Location:"
+Write-Host "  C:\ProgramData\LdapsCertRenew\renew.log"
 Write-Host ""
 Write-Host "=" * 60
 
@@ -402,6 +422,8 @@ if ($runNow -in @('Y', 'y', 'Yes', 'yes')) {
     }
 }
 
+Write-Host ""
 Write-Status "Installation complete" -Type Success
+Write-Status "To uninstall, run: Uninstall-LdapsRenewTask.ps1"
 exit 0
 #endregion

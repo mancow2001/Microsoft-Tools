@@ -22,7 +22,8 @@
     Certificate template name. Default: "LDAPS"
 
 .PARAMETER BaseDomain
-    Optional additional SAN DNS entry for base domain (e.g., "domain.com")
+    Additional SAN DNS entry for base domain (e.g., "domain.com").
+    If not specified, automatically uses the AD domain name from DC identity.
 
 .PARAMETER IncludeShortNameSan
     Include DC hostname (short name) in SAN. Default: $true
@@ -62,6 +63,20 @@
     Ensures the same DC always gets the same delay, evenly distributed.
     Requires -StartupDelayMaxSeconds to be set.
 
+.PARAMETER DiagnoseOnly
+    Run comprehensive diagnostics without making any changes.
+    Checks: execution context, paths, DC status, CA connectivity,
+    template availability, current certificates, and scheduled task config.
+    Use this to troubleshoot configuration issues.
+
+.EXAMPLE
+    .\Renew-LdapsCert.ps1 -DiagnoseOnly
+    # Run diagnostics to verify configuration before enrollment
+
+.EXAMPLE
+    .\Renew-LdapsCert.ps1 -DiagnoseOnly -TemplateName "WebServer"
+    # Check if WebServer template is available
+
 .EXAMPLE
     .\Renew-LdapsCert.ps1 -BaseDomain "contoso.com"
     # Auto-discovers CA from Active Directory
@@ -86,13 +101,13 @@
     .\Renew-LdapsCert.ps1 -CAConfig "CA01\Contoso-CA" -WhatIf -CleanupOld
 
 .NOTES
-    Version: 1.3.0
+    Version: 1.5.2
     Author: PKI Automation
-    Requires: Windows Server 2016+, PowerShell 5.1+
+    Requires: Windows Server 2012 R2+, PowerShell 4.0+
     Run As: Local SYSTEM via Scheduled Task
 #>
 
-#Requires -Version 5.1
+#Requires -Version 4.0
 #Requires -RunAsAdministrator
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -140,7 +155,10 @@ param(
     [int]$StartupDelayMaxSeconds = 0,
 
     [Parameter(Mandatory = $false)]
-    [switch]$UseHostnameBasedDelay
+    [switch]$UseHostnameBasedDelay,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DiagnoseOnly
 )
 
 Set-StrictMode -Version Latest
@@ -152,28 +170,107 @@ $script:SAN_OID = "2.5.29.17"
 $script:EKU_OID = "2.5.29.37"
 $script:WORK_DIR = "C:\ProgramData\LdapsCertRenew"
 $script:ExitCode = 0
-$script:ScriptVersion = "1.3.0"
+$script:ScriptVersion = "1.5.2"
 $script:ScriptStartTime = Get-Date
 $script:VerboseEnabled = $VerboseLogging.IsPresent -or $VerbosePreference -eq 'Continue'
 #endregion
 
 #region Logging Functions
+function Write-EventLogEntry {
+    <#
+    .SYNOPSIS
+        Writes to Windows Event Log as fallback when file logging unavailable.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("Information", "Warning", "Error")]
+        [string]$EntryType = "Information"
+    )
+
+    try {
+        # Use Application log with source "LDAPS-Renewal"
+        $source = "LDAPS-Renewal"
+        if (-not [System.Diagnostics.EventLog]::SourceExists($source)) {
+            [System.Diagnostics.EventLog]::CreateEventSource($source, "Application")
+        }
+        Write-EventLog -LogName "Application" -Source $source -EventId 1000 -EntryType $EntryType -Message $Message
+    }
+    catch {
+        # If event log also fails, nothing we can do
+    }
+}
+
+function Update-Heartbeat {
+    <#
+    .SYNOPSIS
+        Updates a heartbeat file to track script execution regardless of logging status.
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        $heartbeatPath = Join-Path -Path $script:WORK_DIR -ChildPath "heartbeat.txt"
+        $heartbeatDir = Split-Path -Path $heartbeatPath -Parent
+
+        if (-not (Test-Path -Path $heartbeatDir)) {
+            New-Item -Path $heartbeatDir -ItemType Directory -Force | Out-Null
+        }
+
+        $content = @"
+LDAPS Certificate Renewal - Heartbeat
+======================================
+Last Run: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+Script Version: $script:ScriptVersion
+Computer: $env:COMPUTERNAME
+User Context: $env:USERNAME
+Parameters:
+  CAConfig: $CAConfig
+  TemplateName: $TemplateName
+  BaseDomain: $BaseDomain
+  LogPath: $LogPath
+"@
+        Set-Content -Path $heartbeatPath -Value $content -Force
+    }
+    catch {
+        # Heartbeat update failed - try event log
+        Write-EventLogEntry -Message "LDAPS-Renewal heartbeat update failed: $_" -EntryType Warning
+    }
+}
+
 function Initialize-Logging {
     [CmdletBinding()]
     param()
 
-    $logDir = Split-Path -Path $LogPath -Parent
-    if (-not (Test-Path -Path $logDir)) {
-        New-Item -Path $logDir -ItemType Directory -Force | Out-Null
-    }
+    # Always update heartbeat first - this helps diagnose if script runs at all
+    Update-Heartbeat
 
-    # Rotate log if > 10MB
-    if (Test-Path -Path $LogPath) {
-        $logFile = Get-Item -Path $LogPath
-        if ($logFile.Length -gt 10MB) {
-            $archivePath = $LogPath -replace '\.log$', "_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-            Move-Item -Path $LogPath -Destination $archivePath -Force
+    try {
+        $logDir = Split-Path -Path $LogPath -Parent
+        if (-not (Test-Path -Path $logDir)) {
+            New-Item -Path $logDir -ItemType Directory -Force | Out-Null
         }
+
+        # Rotate log if > 10MB
+        if (Test-Path -Path $LogPath) {
+            $logFile = Get-Item -Path $LogPath
+            if ($logFile.Length -gt 10MB) {
+                $archivePath = $LogPath -replace '\.log$', "_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+                Move-Item -Path $LogPath -Destination $archivePath -Force
+            }
+        }
+
+        # Write initialization marker to confirm logging works
+        $initMsg = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff') [INIT] Logging initialized - Script v$script:ScriptVersion starting"
+        Add-Content -Path $LogPath -Value $initMsg -Encoding UTF8
+    }
+    catch {
+        # File logging failed - use Event Log
+        Write-EventLogEntry -Message "LDAPS-Renewal failed to initialize file logging: $_`n`nScript will continue but logs will go to Event Log." -EntryType Warning
+        throw
     }
 }
 
@@ -181,6 +278,7 @@ function Write-Log {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
         [string]$Message,
 
         [Parameter(Mandatory = $false)]
@@ -252,6 +350,7 @@ function Write-LogVerbose {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
         [string]$Message,
 
         [Parameter(Mandatory = $false)]
@@ -427,8 +526,12 @@ function Get-EnvironmentInfo {
 
     # PowerShell Version
     Write-Log -Message "PowerShell Version: $($PSVersionTable.PSVersion)"
-    Write-LogVerbose -Message "PowerShell Edition: $($PSVersionTable.PSEdition)" -Level DEBUG
-    Write-LogVerbose -Message "CLR Version: $($PSVersionTable.CLRVersion)" -Level DEBUG
+    if ($PSVersionTable.ContainsKey('PSEdition')) {
+        Write-LogVerbose -Message "PowerShell Edition: $($PSVersionTable.PSEdition)" -Level DEBUG
+    }
+    if ($PSVersionTable.ContainsKey('CLRVersion')) {
+        Write-LogVerbose -Message "CLR Version: $($PSVersionTable.CLRVersion)" -Level DEBUG
+    }
 
     # Current User Context
     $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -457,10 +560,12 @@ function Get-EnvironmentInfo {
     # certreq.exe availability
     $certreqPath = Get-Command certreq.exe -ErrorAction SilentlyContinue
     if ($certreqPath) {
-        Write-Log -Message "certreq.exe found: $($certreqPath.Source)"
+        # Use Path property (PS4 compatible) instead of Source (PS5+)
+        $certreqFullPath = if ($certreqPath.Path) { $certreqPath.Path } else { $certreqPath.Definition }
+        Write-Log -Message "certreq.exe found: $certreqFullPath"
         Write-LogVerbose -Message "certreq version info:" -Level DEBUG
         try {
-            $versionInfo = (Get-Item $certreqPath.Source).VersionInfo
+            $versionInfo = (Get-Item $certreqFullPath).VersionInfo
             Write-LogVerbose -Message "  File Version: $($versionInfo.FileVersion)" -Level DEBUG
             Write-LogVerbose -Message "  Product Version: $($versionInfo.ProductVersion)" -Level DEBUG
         }
@@ -475,7 +580,7 @@ function Get-EnvironmentInfo {
     # Certificate Store Access Test
     Write-LogVerbose -Message "Testing certificate store access..." -Level DEBUG
     try {
-        $testCerts = Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction Stop
+        $testCerts = @(Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction Stop)
         Write-LogVerbose -Message "  LocalMachine\My accessible, contains $($testCerts.Count) certificates" -Level DEBUG
     }
     catch {
@@ -648,9 +753,9 @@ function Select-CertificateAuthority {
     # Filter by template if specified
     $candidates = $AvailableCAs
     if (-not [string]::IsNullOrWhiteSpace($TemplateName)) {
-        $withTemplate = $AvailableCAs | Where-Object { $_.HasRequiredTemplate }
+        $withTemplate = @($AvailableCAs | Where-Object { $_.HasRequiredTemplate })
         if ($withTemplate.Count -gt 0) {
-            $candidates = @($withTemplate)
+            $candidates = $withTemplate
             Write-Log -Message "  Filtered to $($candidates.Count) CA(s) with template '$TemplateName'"
         }
         else {
@@ -662,11 +767,11 @@ function Select-CertificateAuthority {
     if (-not [string]::IsNullOrWhiteSpace($PreferredCA)) {
         Write-Log -Message "  Applying preference filter: '$PreferredCA'"
 
-        $preferred = $candidates | Where-Object {
+        $preferred = @($candidates | Where-Object {
             $_.Name -like "*$PreferredCA*" -or
             $_.DNSHostName -like "*$PreferredCA*" -or
             $_.Config -like "*$PreferredCA*"
-        }
+        })
 
         if ($preferred.Count -gt 0) {
             $selected = $preferred[0]
@@ -712,7 +817,7 @@ function Resolve-CAConfiguration {
     Write-Log -Message "No CA specified - initiating auto-discovery..."
 
     # Discover CAs from AD
-    $discoveredCAs = Get-EnterpriseCAs -TemplateName $TemplateName
+    $discoveredCAs = @(Get-EnterpriseCAs -TemplateName $TemplateName)
 
     if ($discoveredCAs.Count -eq 0) {
         Write-Log -Message "No Enterprise CAs discovered in Active Directory" -Level ERROR
@@ -983,9 +1088,9 @@ function Get-LdapsCandidateCertificates {
 
     Write-LogVerbose -Message "Enumerating all certificates in LocalMachine\My..." -Level DEBUG
 
-    $allCerts = Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue
+    $allCerts = @(Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue)
 
-    if ($null -eq $allCerts -or $allCerts.Count -eq 0) {
+    if ($allCerts.Count -eq 0) {
         Write-Log -Message "No certificates found in LocalMachine\My store"
         return @()
     }
@@ -1719,7 +1824,7 @@ function Request-LdapsCertificate {
                 Write-Log -Message "Thumbprint not in certreq output, searching certificate store..."
                 # Wait briefly for store update
                 Start-Sleep -Seconds 2
-                $newCandidates = Get-LdapsCandidateCertificates -DcFqdn $DcFqdn
+                $newCandidates = @(Get-LdapsCandidateCertificates -DcFqdn $DcFqdn)
                 if ($newCandidates.Count -gt 0) {
                     $newestCert = $newCandidates | Sort-Object -Property NotAfter -Descending | Select-Object -First 1
                     $newThumbprint = $newestCert.Thumbprint
@@ -1794,7 +1899,7 @@ function Test-NewCertificateCompliance {
         [string]$DcHostname,
 
         [Parameter(Mandatory = $false)]
-        [datetime]$PreviousNotAfter
+        [System.Nullable[datetime]]$PreviousNotAfter
     )
 
     Write-LogSection -Title "Post-Installation Verification"
@@ -1927,7 +2032,7 @@ function Test-NewCertificateCompliance {
 
     # Summary
     Write-Log -Message ""
-    Write-Log -Message "=" * 50
+    Write-Log -Message ("=" * 50)
     if ($allPassed) {
         Write-Log -Message "VERIFICATION RESULT: ALL CHECKS PASSED"
         Write-Log -Message "Certificate is compliant and ready for use"
@@ -1936,7 +2041,7 @@ function Test-NewCertificateCompliance {
         Write-Log -Message "VERIFICATION RESULT: ONE OR MORE CHECKS FAILED" -Level ERROR
         Write-Log -Message "Certificate may not function correctly for LDAPS" -Level ERROR
     }
-    Write-Log -Message "=" * 50
+    Write-Log -Message ("=" * 50)
 
     return $allPassed
 }
@@ -1962,7 +2067,7 @@ function Remove-SupersededCertificates {
     Write-Log -Message "Cleanup requested - evaluating superseded certificates..."
     Write-Log -Message "New certificate thumbprint (to keep): $NewThumbprint"
 
-    $toRemove = $AllCandidates | Where-Object { $_.Thumbprint -ne $NewThumbprint }
+    $toRemove = @($AllCandidates | Where-Object { $_.Thumbprint -ne $NewThumbprint })
 
     if ($toRemove.Count -eq 0) {
         Write-Log -Message "No superseded certificates to remove"
@@ -2043,12 +2148,19 @@ function Invoke-LdapsCertRenewal {
         # Get DC identity
         $dcIdentity = Get-DcIdentity
 
+        # Auto-include AD domain as base domain if not explicitly specified
+        $effectiveBaseDomain = $BaseDomain
+        if ([string]::IsNullOrWhiteSpace($effectiveBaseDomain)) {
+            $effectiveBaseDomain = $dcIdentity.DnsDomain
+            Write-Log -Message "Auto-including AD domain as base domain SAN: $effectiveBaseDomain"
+        }
+
         # Discover candidate certificates
         $candidates = @(Get-LdapsCandidateCertificates -DcFqdn $dcIdentity.FQDN)
 
         # Determine state and required action
         $state = Get-CertificateState -Candidates $candidates -RenewThresholdDays $RenewWithinDays `
-            -RequiredBaseDomain $BaseDomain -DcFqdn $dcIdentity.FQDN `
+            -RequiredBaseDomain $effectiveBaseDomain -DcFqdn $dcIdentity.FQDN `
             -RequireShortName $IncludeShortNameSan -DcHostname $dcIdentity.Hostname
 
         # Log state summary
@@ -2083,7 +2195,7 @@ function Invoke-LdapsCertRenewal {
         # Perform enrollment
         $enrollResult = Request-LdapsCertificate -CAConfig $resolvedCAConfig -TemplateName $TemplateName `
             -DcFqdn $dcIdentity.FQDN -DcHostname $dcIdentity.Hostname `
-            -BaseDomain $BaseDomain -IncludeShortName $IncludeShortNameSan `
+            -BaseDomain $effectiveBaseDomain -IncludeShortName $IncludeShortNameSan `
             -KeySize $MinKeySize -HashAlgorithm $HashAlgorithm
 
         if ($enrollResult.WhatIf) {
@@ -2098,7 +2210,7 @@ function Invoke-LdapsCertRenewal {
             return 0
         }
 
-        if ($enrollResult.Pending) {
+        if ($enrollResult.PSObject.Properties['Pending'] -and $enrollResult.Pending) {
             Write-Log -Message ""
             Write-Log -Message "Certificate request is pending CA manager approval" -Level WARN
             Write-Log -Message "Request ID: $($enrollResult.RequestId)" -Level WARN
@@ -2125,7 +2237,7 @@ function Invoke-LdapsCertRenewal {
 
         # Verify new certificate
         $verifyPassed = Test-NewCertificateCompliance -Thumbprint $enrollResult.Thumbprint `
-            -DcFqdn $dcIdentity.FQDN -BaseDomain $BaseDomain `
+            -DcFqdn $dcIdentity.FQDN -BaseDomain $effectiveBaseDomain `
             -RequireShortName $IncludeShortNameSan -DcHostname $dcIdentity.Hostname `
             -PreviousNotAfter $previousNotAfter
 
@@ -2144,9 +2256,9 @@ function Invoke-LdapsCertRenewal {
 
         # Output thumbprint for rollback purposes
         Write-Log -Message ""
-        Write-Log -Message "=" * 50
+        Write-Log -Message ("=" * 50)
         Write-Log -Message "NEW CERTIFICATE THUMBPRINT: $($enrollResult.Thumbprint)"
-        Write-Log -Message "=" * 50
+        Write-Log -Message ("=" * 50)
         Write-Output "NewCertificateThumbprint: $($enrollResult.Thumbprint)"
 
         # Cleanup old certificates if requested
@@ -2197,7 +2309,322 @@ function Invoke-LdapsCertRenewal {
     }
 }
 
+function Invoke-Diagnostics {
+    <#
+    .SYNOPSIS
+        Runs comprehensive diagnostics without making any changes.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host ""
+    Write-Host "=" * 70 -ForegroundColor Cyan
+    Write-Host "LDAPS Certificate Renewal - Diagnostic Mode" -ForegroundColor Cyan
+    Write-Host "Version: $script:ScriptVersion" -ForegroundColor Cyan
+    Write-Host "=" * 70 -ForegroundColor Cyan
+    Write-Host ""
+
+    $issues = @()
+    $warnings = @()
+
+    # 1. Check execution context
+    Write-Host "[1/7] Checking execution context..." -ForegroundColor Yellow
+    Write-Host "  Computer: $env:COMPUTERNAME"
+    Write-Host "  User: $env:USERNAME"
+    Write-Host "  Domain: $env:USERDOMAIN"
+
+    $isSystem = $env:USERNAME -eq "$env:COMPUTERNAME$"
+    if ($isSystem) {
+        Write-Host "  Running as: SYSTEM (correct for scheduled task)" -ForegroundColor Green
+    }
+    else {
+        Write-Host "  Running as: $env:USERNAME (interactive)" -ForegroundColor Yellow
+        $warnings += "Running interactively - scheduled task runs as SYSTEM"
+    }
+    Write-Host ""
+
+    # 2. Check paths and permissions
+    Write-Host "[2/7] Checking paths and permissions..." -ForegroundColor Yellow
+    $workDir = $script:WORK_DIR
+    Write-Host "  Work directory: $workDir"
+
+    if (Test-Path -Path $workDir) {
+        Write-Host "    Status: EXISTS" -ForegroundColor Green
+        try {
+            $testFile = Join-Path -Path $workDir -ChildPath "diag_test_$(Get-Random).tmp"
+            Set-Content -Path $testFile -Value "test" -Force
+            Remove-Item -Path $testFile -Force
+            Write-Host "    Write access: YES" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "    Write access: NO - $_" -ForegroundColor Red
+            $issues += "Cannot write to work directory: $workDir"
+        }
+    }
+    else {
+        Write-Host "    Status: DOES NOT EXIST (will be created)" -ForegroundColor Yellow
+        try {
+            New-Item -Path $workDir -ItemType Directory -Force | Out-Null
+            Write-Host "    Created successfully" -ForegroundColor Green
+            Remove-Item -Path $workDir -Force
+        }
+        catch {
+            Write-Host "    Cannot create: $_" -ForegroundColor Red
+            $issues += "Cannot create work directory: $workDir"
+        }
+    }
+
+    Write-Host "  Log path: $LogPath"
+    $logDir = Split-Path -Path $LogPath -Parent
+    if (Test-Path -Path $logDir) {
+        Write-Host "    Log directory exists: YES" -ForegroundColor Green
+    }
+    else {
+        Write-Host "    Log directory exists: NO (will be created)" -ForegroundColor Yellow
+    }
+    Write-Host ""
+
+    # 3. Check if this is a DC
+    Write-Host "[3/7] Checking Domain Controller status..." -ForegroundColor Yellow
+    try {
+        $dcInfo = Get-WmiObject -Class Win32_ComputerSystem
+        if ($dcInfo.DomainRole -ge 4) {
+            Write-Host "  This is a Domain Controller: YES" -ForegroundColor Green
+            Write-Host "  Domain: $($dcInfo.Domain)"
+        }
+        else {
+            Write-Host "  This is a Domain Controller: NO" -ForegroundColor Red
+            $issues += "This server is not a Domain Controller (DomainRole: $($dcInfo.DomainRole))"
+        }
+    }
+    catch {
+        Write-Host "  Could not determine DC status: $_" -ForegroundColor Red
+        $issues += "Cannot determine if server is a DC"
+    }
+    Write-Host ""
+
+    # 4. Check CA discovery
+    Write-Host "[4/7] Checking Certificate Authority configuration..." -ForegroundColor Yellow
+    Write-Host "  Specified CAConfig: $(if ([string]::IsNullOrWhiteSpace($CAConfig)) { '(auto-discover)' } else { $CAConfig })"
+
+    if ([string]::IsNullOrWhiteSpace($CAConfig)) {
+        Write-Host "  Attempting CA auto-discovery from AD..."
+        try {
+            $configContext = ([ADSI]"LDAP://RootDSE").configurationNamingContext
+            $enrollServicesPath = "LDAP://CN=Enrollment Services,CN=Public Key Services,CN=Services,$configContext"
+            $enrollServices = [ADSI]$enrollServicesPath
+            $caCount = @($enrollServices.Children).Count
+
+            if ($caCount -gt 0) {
+                Write-Host "  Found $caCount Enterprise CA(s):" -ForegroundColor Green
+                foreach ($ca in $enrollServices.Children) {
+                    $caHost = $ca.dNSHostName
+                    $caName = $ca.cn
+                    Write-Host "    - $caHost\$caName"
+                }
+            }
+            else {
+                Write-Host "  No Enterprise CAs found in AD" -ForegroundColor Red
+                $issues += "No Enterprise CAs found in Active Directory"
+            }
+        }
+        catch {
+            Write-Host "  CA discovery failed: $_" -ForegroundColor Red
+            $issues += "CA auto-discovery failed: $_"
+        }
+    }
+    else {
+        # Test explicit CA
+        Write-Host "  Testing connectivity to: $CAConfig"
+        try {
+            $certutilOutput = & certutil -ping $CAConfig 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  CA is reachable: YES" -ForegroundColor Green
+            }
+            else {
+                Write-Host "  CA is reachable: NO" -ForegroundColor Red
+                $issues += "Cannot reach CA: $CAConfig"
+            }
+        }
+        catch {
+            Write-Host "  CA connectivity test failed: $_" -ForegroundColor Red
+            $issues += "CA connectivity test failed"
+        }
+    }
+    Write-Host ""
+
+    # 5. Check template
+    Write-Host "[5/7] Checking certificate template..." -ForegroundColor Yellow
+    Write-Host "  Template name: $TemplateName"
+
+    try {
+        # Try to get template info from certutil
+        $templateCheck = & certutil -template $TemplateName 2>&1
+        if ($LASTEXITCODE -eq 0 -and $templateCheck -notmatch "not found") {
+            Write-Host "  Template exists in AD: YES" -ForegroundColor Green
+        }
+        else {
+            Write-Host "  Template exists in AD: UNKNOWN or NO" -ForegroundColor Yellow
+            $warnings += "Could not verify template '$TemplateName' exists. Ensure template is published to CA."
+        }
+    }
+    catch {
+        Write-Host "  Template check failed: $_" -ForegroundColor Yellow
+        $warnings += "Could not verify template existence"
+    }
+
+    # List templates on default CA
+    Write-Host ""
+    Write-Host "  Available templates on CA (checking...):"
+    try {
+        $caTemplates = & certutil -catemplates 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $templateLines = $caTemplates | Where-Object { $_ -match "^\s*\S+:" }
+            $found = $false
+            foreach ($line in $templateLines) {
+                if ($line -match "^(\S+):") {
+                    $tplName = $Matches[1]
+                    if ($tplName -eq $TemplateName) {
+                        Write-Host "    [MATCH] $tplName" -ForegroundColor Green
+                        $found = $true
+                    }
+                    else {
+                        Write-Host "    $tplName"
+                    }
+                }
+            }
+            if (-not $found) {
+                Write-Host "  WARNING: Template '$TemplateName' not found in CA template list" -ForegroundColor Red
+                $issues += "Template '$TemplateName' is not published on the CA. Use -TemplateName to specify an available template."
+            }
+        }
+        else {
+            Write-Host "    Could not list templates: $caTemplates" -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host "    Template listing failed: $_" -ForegroundColor Yellow
+    }
+    Write-Host ""
+
+    # 6. Check current LDAPS certificates
+    Write-Host "[6/7] Checking current LDAPS certificates..." -ForegroundColor Yellow
+    try {
+        $ldapsCerts = Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.EnhancedKeyUsageList.ObjectId -contains $script:SERVER_AUTH_OID
+            }
+
+        $ldapsCertCount = @($ldapsCerts).Count
+        if ($ldapsCertCount -gt 0) {
+            Write-Host "  Found $ldapsCertCount certificate(s) with Server Authentication:" -ForegroundColor Green
+            foreach ($cert in $ldapsCerts) {
+                $status = if ($cert.NotAfter -lt (Get-Date)) { "EXPIRED" } elseif ($cert.NotAfter -lt (Get-Date).AddDays($RenewWithinDays)) { "EXPIRING SOON" } else { "VALID" }
+                $statusColor = switch ($status) { "EXPIRED" { "Red" } "EXPIRING SOON" { "Yellow" } default { "Green" } }
+                Write-Host "    Subject: $($cert.Subject)" -ForegroundColor $statusColor
+                Write-Host "    Thumbprint: $($cert.Thumbprint)"
+                Write-Host "    Expires: $($cert.NotAfter) [$status]" -ForegroundColor $statusColor
+                Write-Host ""
+            }
+        }
+        else {
+            Write-Host "  No LDAPS-compatible certificates found (will bootstrap)" -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host "  Certificate check failed: $_" -ForegroundColor Red
+        $issues += "Cannot access certificate store"
+    }
+    Write-Host ""
+
+    # 7. Check scheduled task
+    Write-Host "[7/7] Checking scheduled task configuration..." -ForegroundColor Yellow
+    try {
+        $task = Get-ScheduledTask -TaskName "LDAPS Cert Renewal" -ErrorAction SilentlyContinue
+        if ($task) {
+            Write-Host "  Scheduled task found: YES" -ForegroundColor Green
+            Write-Host "  State: $($task.State)"
+
+            $taskAction = $task.Actions | Select-Object -First 1
+            if ($taskAction) {
+                Write-Host "  Execute: $($taskAction.Execute)"
+                Write-Host "  Arguments: $($taskAction.Arguments)"
+
+                # Check if arguments contain the correct template
+                if ($taskAction.Arguments -match "-TemplateName `"([^`"]+)`"") {
+                    $configuredTemplate = $Matches[1]
+                    Write-Host "  Configured template: $configuredTemplate"
+                    if ($configuredTemplate -ne $TemplateName) {
+                        Write-Host "    WARNING: Running diagnostic with different template than configured in task" -ForegroundColor Yellow
+                        $warnings += "Scheduled task uses template '$configuredTemplate' but you specified '$TemplateName'"
+                    }
+                }
+            }
+
+            $taskInfo = Get-ScheduledTaskInfo -TaskName "LDAPS Cert Renewal" -ErrorAction SilentlyContinue
+            if ($taskInfo) {
+                Write-Host "  Last run: $($taskInfo.LastRunTime)"
+                Write-Host "  Last result: $($taskInfo.LastTaskResult)"
+            }
+        }
+        else {
+            Write-Host "  Scheduled task found: NO" -ForegroundColor Yellow
+            $warnings += "No scheduled task found - run Install-LdapsRenewTask.ps1 to install"
+        }
+    }
+    catch {
+        Write-Host "  Task check failed: $_" -ForegroundColor Yellow
+    }
+    Write-Host ""
+
+    # Summary
+    Write-Host "=" * 70 -ForegroundColor Cyan
+    Write-Host "Diagnostic Summary" -ForegroundColor Cyan
+    Write-Host "=" * 70 -ForegroundColor Cyan
+    Write-Host ""
+
+    if ($issues.Count -eq 0 -and $warnings.Count -eq 0) {
+        Write-Host "All checks passed! Configuration appears correct." -ForegroundColor Green
+        Write-Host ""
+        Write-Host "Next steps:" -ForegroundColor Cyan
+        Write-Host "  1. Run with -WhatIf to preview enrollment"
+        Write-Host "  2. Run without switches to perform actual enrollment"
+        return 0
+    }
+
+    if ($issues.Count -gt 0) {
+        Write-Host "ISSUES FOUND ($($issues.Count)):" -ForegroundColor Red
+        foreach ($issue in $issues) {
+            Write-Host "  [X] $issue" -ForegroundColor Red
+        }
+        Write-Host ""
+    }
+
+    if ($warnings.Count -gt 0) {
+        Write-Host "WARNINGS ($($warnings.Count)):" -ForegroundColor Yellow
+        foreach ($warn in $warnings) {
+            Write-Host "  [!] $warn" -ForegroundColor Yellow
+        }
+        Write-Host ""
+    }
+
+    if ($issues.Count -gt 0) {
+        Write-Host "Please resolve the issues above before running certificate enrollment." -ForegroundColor Red
+        return 1
+    }
+    else {
+        Write-Host "Warnings noted but enrollment may still succeed." -ForegroundColor Yellow
+        return 0
+    }
+}
+
 # Initialize logging and run
+if ($DiagnoseOnly) {
+    # Run diagnostics without logging initialization
+    $script:ExitCode = Invoke-Diagnostics
+    exit $script:ExitCode
+}
+
 Initialize-Logging
 $script:ExitCode = Invoke-LdapsCertRenewal
 exit $script:ExitCode
