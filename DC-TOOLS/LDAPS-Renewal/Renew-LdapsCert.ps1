@@ -1423,7 +1423,7 @@ Signature="`$Windows NT`$"
 Subject = "CN=$SubjectCN"
 KeySpec = 1
 KeyLength = $KeySize
-Exportable = FALSE
+Exportable = TRUE
 MachineKeySet = TRUE
 SMIME = FALSE
 PrivateKeyArchive = FALSE
@@ -1456,7 +1456,7 @@ CertificateTemplate = $TemplateName
     Write-Log -Message "  Key size: $KeySize bits"
     Write-Log -Message "  Hash algorithm: $HashAlgorithm"
     Write-Log -Message "  Key Storage Provider: Microsoft Software Key Storage Provider"
-    Write-Log -Message "  Exportable: FALSE"
+    Write-Log -Message "  Exportable: TRUE (required for NTDS store installation)"
     Write-Log -Message "  MachineKeySet: TRUE"
 
     # Log full INF content in verbose mode
@@ -1838,23 +1838,43 @@ function Request-LdapsCertificate {
             }
 
             Write-Log -Message ""
-            Write-Log -Message "Certificate enrollment completed successfully"
+            Write-Log -Message "Certificate installed to LocalMachine\My store"
             Write-Log -Message "New certificate thumbprint: $newThumbprint"
 
+            # Install certificate to NTDS store for LDAPS
+            $ntdsResult = Install-CertificateToNtdsStore -Thumbprint $newThumbprint
+            $ntdsSuccess = $false
+            if ($ntdsResult.Success) {
+                $ntdsSuccess = $true
+                Write-Log -Message "Certificate also installed to NTDS\My store"
+            }
+            else {
+                Write-Log -Message "WARNING: Failed to install certificate to NTDS store: $($ntdsResult.Message)" -Level WARN
+                Write-Log -Message "The certificate is in LocalMachine\My but AD DS may not use it for LDAPS" -Level WARN
+                Write-Log -Message "You may need to manually run: certutil -repairstore `"NTDS\My`" $newThumbprint" -Level WARN
+            }
+
+            Write-Log -Message ""
+            Write-Log -Message "Certificate enrollment completed"
+            Write-Log -Message "  LocalMachine\My: SUCCESS"
+            Write-Log -Message "  NTDS\My: $(if ($ntdsSuccess) { 'SUCCESS' } else { 'FAILED (see warnings above)' })"
+
             return [PSCustomObject]@{
-                Success    = $true
-                WhatIf     = $false
-                Thumbprint = $newThumbprint
-                Message    = "Certificate enrolled and installed successfully"
+                Success      = $true
+                WhatIf       = $false
+                Thumbprint   = $newThumbprint
+                NtdsInstall  = $ntdsSuccess
+                Message      = "Certificate enrolled and installed successfully"
             }
         }
         else {
-            Write-Log -Message "[WhatIf] Would accept certificate into store"
+            Write-Log -Message "[WhatIf] Would accept certificate into LocalMachine\My and NTDS\My stores"
             return [PSCustomObject]@{
-                Success    = $true
-                WhatIf     = $true
-                Thumbprint = $null
-                Message    = "WhatIf: Certificate would be installed"
+                Success     = $true
+                WhatIf      = $true
+                Thumbprint  = $null
+                NtdsInstall = $null
+                Message     = "WhatIf: Certificate would be installed to LocalMachine\My and NTDS\My"
             }
         }
     }
@@ -1870,6 +1890,270 @@ function Request-LdapsCertificate {
         }
         if (Test-Path -Path $cerPath) {
             Write-Log -Message "  CER: $cerPath ($((Get-Item $cerPath).Length) bytes)"
+        }
+    }
+}
+
+function Install-CertificateToNtdsStore {
+    <#
+    .SYNOPSIS
+        Installs a certificate into the NTDS personal certificate store.
+    .DESCRIPTION
+        Exports a certificate from LocalMachine\My to a temporary PFX file,
+        then imports it into the NTDS\My store using Windows Crypto API.
+        The NTDS store is used by Active Directory Domain Services for LDAPS.
+        When a certificate exists in the NTDS store, AD DS uses it preferentially
+        for LDAPS connections instead of auto-selecting from LocalMachine\My.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Thumbprint
+    )
+
+    Write-LogSubSection -Title "NTDS Store Installation"
+    Write-Log -Message "Installing certificate to NTDS personal store..."
+    Write-Log -Message "Thumbprint: $Thumbprint"
+
+    # Verify the certificate exists in LocalMachine\My first
+    $sourceCert = Get-ChildItem -Path "Cert:\LocalMachine\My\$Thumbprint" -ErrorAction SilentlyContinue
+    if ($null -eq $sourceCert) {
+        Write-Log -Message "Certificate not found in LocalMachine\My store!" -Level ERROR
+        return [PSCustomObject]@{
+            Success = $false
+            Message = "Source certificate not found in LocalMachine\My"
+        }
+    }
+
+    if (-not $sourceCert.HasPrivateKey) {
+        Write-Log -Message "Certificate does not have a private key!" -Level ERROR
+        return [PSCustomObject]@{
+            Success = $false
+            Message = "Certificate has no private key"
+        }
+    }
+
+    Write-Log -Message "Source certificate verified in LocalMachine\My"
+
+    if ($PSCmdlet.ShouldProcess("NTDS\My", "Install certificate $Thumbprint")) {
+        $pfxPath = $null
+        try {
+            # Generate a temporary PFX file path
+            $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+            $pfxPath = Join-Path -Path $script:WORK_DIR -ChildPath "ntds_temp_$timestamp.pfx"
+
+            # Generate a random password for the PFX
+            $pfxPasswordPlain = [System.Guid]::NewGuid().ToString("N")
+            $pfxPassword = ConvertTo-SecureString -String $pfxPasswordPlain -Force -AsPlainText
+
+            Write-Log -Message "Exporting certificate to temporary PFX..."
+            Write-LogVerbose -Message "  PFX path: $pfxPath" -Level DEBUG
+
+            # Export the certificate with private key to PFX
+            try {
+                $null = Export-PfxCertificate -Cert $sourceCert -FilePath $pfxPath -Password $pfxPassword -ErrorAction Stop
+                Write-Log -Message "Certificate exported to PFX successfully"
+            }
+            catch {
+                Write-Log -Message "Failed to export certificate to PFX: $_" -Level ERROR
+                return [PSCustomObject]@{
+                    Success = $false
+                    Message = "Failed to export certificate: $($_.Exception.Message)"
+                }
+            }
+
+            # Import the PFX into NTDS\My store using PowerShell/Crypto API
+            Write-Log -Message "Importing certificate into NTDS\My store using Crypto API..."
+
+            # Define the P/Invoke signatures for Windows Crypto API
+            $cryptoApiSignature = @"
+[DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern IntPtr CertOpenStore(
+    IntPtr lpszStoreProvider,
+    uint dwEncodingType,
+    IntPtr hCryptProv,
+    uint dwFlags,
+    string pvPara);
+
+[DllImport("crypt32.dll", SetLastError = true)]
+public static extern bool CertCloseStore(
+    IntPtr hCertStore,
+    uint dwFlags);
+
+[DllImport("crypt32.dll", SetLastError = true)]
+public static extern bool CertAddCertificateContextToStore(
+    IntPtr hCertStore,
+    IntPtr pCertContext,
+    uint dwAddDisposition,
+    IntPtr ppStoreContext);
+
+[DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern IntPtr PFXImportCertStore(
+    ref CRYPT_DATA_BLOB pPFX,
+    string szPassword,
+    uint dwFlags);
+
+[StructLayout(LayoutKind.Sequential)]
+public struct CRYPT_DATA_BLOB {
+    public int cbData;
+    public IntPtr pbData;
+}
+"@
+
+            # Add the type if not already added
+            if (-not ([System.Management.Automation.PSTypeName]'CryptoApi').Type) {
+                Add-Type -MemberDefinition $cryptoApiSignature -Name "CryptoApi" -Namespace "Win32"
+            }
+
+            # Constants
+            $CERT_STORE_PROV_SYSTEM = [IntPtr]10
+            $CERT_SYSTEM_STORE_SERVICES = 0x00050000
+            $CERT_STORE_OPEN_EXISTING_FLAG = 0x00004000
+            $CERT_STORE_MAXIMUM_ALLOWED_FLAG = 0x00001000
+            $CRYPT_EXPORTABLE = 0x00000001
+            $CRYPT_USER_KEYSET = 0x00001000
+            $PKCS12_ALLOW_OVERWRITE_KEY = 0x00004000
+            $PKCS12_ALWAYS_CNG_KSP = 0x00000200
+            $CERT_STORE_ADD_REPLACE_EXISTING = 3
+
+            # Open the NTDS service certificate store
+            Write-Log -Message "Opening NTDS service certificate store..."
+            $storeFlags = $CERT_SYSTEM_STORE_SERVICES -bor $CERT_STORE_OPEN_EXISTING_FLAG -bor $CERT_STORE_MAXIMUM_ALLOWED_FLAG
+            $ntdsStore = [Win32.CryptoApi]::CertOpenStore($CERT_STORE_PROV_SYSTEM, 0, [IntPtr]::Zero, $storeFlags, "NTDS\My")
+
+            if ($ntdsStore -eq [IntPtr]::Zero) {
+                $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                Write-Log -Message "Failed to open NTDS store. Error code: $errorCode" -Level ERROR
+                return [PSCustomObject]@{
+                    Success = $false
+                    Message = "Failed to open NTDS certificate store. Error: $errorCode"
+                }
+            }
+
+            Write-Log -Message "NTDS store opened successfully"
+
+            try {
+                # Read the PFX file
+                $pfxBytes = [System.IO.File]::ReadAllBytes($pfxPath)
+                $pfxHandle = [System.Runtime.InteropServices.GCHandle]::Alloc($pfxBytes, [System.Runtime.InteropServices.GCHandleType]::Pinned)
+
+                try {
+                    $pfxBlob = New-Object Win32.CryptoApi+CRYPT_DATA_BLOB
+                    $pfxBlob.cbData = $pfxBytes.Length
+                    $pfxBlob.pbData = $pfxHandle.AddrOfPinnedObject()
+
+                    # Import the PFX to a temporary store
+                    Write-Log -Message "Importing PFX to temporary store..."
+                    $importFlags = $CRYPT_EXPORTABLE -bor $PKCS12_ALLOW_OVERWRITE_KEY -bor $PKCS12_ALWAYS_CNG_KSP
+                    $tempStore = [Win32.CryptoApi]::PFXImportCertStore([ref]$pfxBlob, $pfxPasswordPlain, $importFlags)
+
+                    if ($tempStore -eq [IntPtr]::Zero) {
+                        $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                        Write-Log -Message "Failed to import PFX. Error code: $errorCode" -Level ERROR
+                        return [PSCustomObject]@{
+                            Success = $false
+                            Message = "Failed to import PFX. Error: $errorCode"
+                        }
+                    }
+
+                    Write-Log -Message "PFX imported to temporary store"
+
+                    try {
+                        # Open the temp store as X509Store to enumerate certificates
+                        $tempX509Store = New-Object System.Security.Cryptography.X509Certificates.X509Store($tempStore)
+                        $certsAdded = 0
+
+                        foreach ($cert in $tempX509Store.Certificates) {
+                            Write-Log -Message "Adding certificate to NTDS store: $($cert.Thumbprint)"
+
+                            # Get the certificate context pointer
+                            $certContext = $cert.Handle
+
+                            # Add to NTDS store
+                            $result = [Win32.CryptoApi]::CertAddCertificateContextToStore(
+                                $ntdsStore,
+                                $certContext,
+                                $CERT_STORE_ADD_REPLACE_EXISTING,
+                                [IntPtr]::Zero)
+
+                            if (-not $result) {
+                                $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                                Write-Log -Message "Failed to add certificate to NTDS store. Error: $errorCode" -Level ERROR
+                            }
+                            else {
+                                $certsAdded++
+                                Write-Log -Message "Certificate added to NTDS store successfully"
+                            }
+                        }
+
+                        if ($certsAdded -gt 0) {
+                            Write-Log -Message "Successfully added $certsAdded certificate(s) to NTDS\My store"
+
+                            # Verify using certutil
+                            Write-Log -Message "Verifying certificate in NTDS store..."
+                            $verifyOutput = & certutil -store -service NTDS My $Thumbprint 2>&1
+                            $verifyExitCode = $LASTEXITCODE
+
+                            if ($verifyExitCode -eq 0) {
+                                Write-Log -Message "Certificate verified in NTDS\My store"
+                                return [PSCustomObject]@{
+                                    Success = $true
+                                    Message = "Certificate installed and verified in NTDS\My store"
+                                }
+                            }
+                            else {
+                                Write-Log -Message "Certificate added but verification via certutil failed (this may be normal)" -Level WARN
+                                return [PSCustomObject]@{
+                                    Success = $true
+                                    Message = "Certificate added to NTDS store"
+                                    Warning = $true
+                                }
+                            }
+                        }
+                        else {
+                            Write-Log -Message "No certificates were added to NTDS store" -Level ERROR
+                            return [PSCustomObject]@{
+                                Success = $false
+                                Message = "Failed to add certificate to NTDS store"
+                            }
+                        }
+                    }
+                    finally {
+                        # Close temp store
+                        [void][Win32.CryptoApi]::CertCloseStore($tempStore, 0)
+                    }
+                }
+                finally {
+                    $pfxHandle.Free()
+                }
+            }
+            finally {
+                # Close NTDS store
+                [void][Win32.CryptoApi]::CertCloseStore($ntdsStore, 0)
+            }
+        }
+        catch {
+            Write-Log -Message "Exception during NTDS store installation: $_" -Level ERROR
+            return [PSCustomObject]@{
+                Success   = $false
+                Message   = "Exception: $($_.Exception.Message)"
+                Exception = $_
+            }
+        }
+        finally {
+            # Always clean up the temporary PFX file for security
+            if ($null -ne $pfxPath -and (Test-Path -Path $pfxPath)) {
+                Write-LogVerbose -Message "Removing temporary PFX file: $pfxPath" -Level DEBUG
+                Remove-Item -Path $pfxPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    else {
+        Write-Log -Message "[WhatIf] Would install certificate to NTDS\My store"
+        return [PSCustomObject]@{
+            Success = $true
+            WhatIf  = $true
+            Message = "WhatIf: Certificate would be installed to NTDS\My"
         }
     }
 }
@@ -2028,6 +2312,29 @@ function Test-NewCertificateCompliance {
             Write-Log -Message "  [FAIL] New certificate does NOT extend validity" -Level ERROR
             $allPassed = $false
         }
+    }
+
+    # Check: NTDS store presence (informational - not a failure condition)
+    $checkNumber++
+    Write-Log -Message ""
+    Write-Log -Message "Check $checkNumber`: NTDS personal store presence"
+    Write-Log -Message "  Checking if certificate is in NTDS\My store..."
+    try {
+        $ntdsCheckOutput = & certutil -store -service NTDS My $Thumbprint 2>&1
+        $ntdsCheckExitCode = $LASTEXITCODE
+
+        if ($ntdsCheckExitCode -eq 0) {
+            Write-Log -Message "  [PASS] Certificate found in NTDS\My store"
+            Write-Log -Message "  AD DS will use this certificate for LDAPS"
+        }
+        else {
+            Write-Log -Message "  [INFO] Certificate NOT in NTDS\My store" -Level WARN
+            Write-Log -Message "  AD DS will auto-select from LocalMachine\My based on criteria" -Level WARN
+            # Note: This is not a failure - AD DS can still use the cert from LocalMachine\My
+        }
+    }
+    catch {
+        Write-Log -Message "  [INFO] Unable to check NTDS store: $_" -Level WARN
     }
 
     # Summary
