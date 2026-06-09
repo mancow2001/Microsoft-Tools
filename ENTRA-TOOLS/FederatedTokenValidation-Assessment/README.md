@@ -73,11 +73,13 @@ Or, if you prefer, let the script do it by passing `-InstallGraphModules`.
 
 | Scope | Used for | Required? |
 |-------|----------|-----------|
-| `Domain.Read.All` | Read verified domains and federation configuration. | Always |
+| `Directory.Read.All` | Read verified domains and federation configuration. | Always |
 | `User.Read.All` | Read user UPN, mail, proxyAddresses, on-prem sync attributes. | Always |
 | `AuditLog.Read.All` | Pull recent sign-in failures for AADSTS5000820. | Only when `-IncludeSignInLogs` is used |
 
-If admin consent for these scopes is not yet granted in the tenant, a Global Administrator (or Privileged Role Administrator) must consent on first run.
+> **Note on `Directory.Read.All` vs `Domain.Read.All`.** Reading the `/domains` and `/domains/{id}/federationConfiguration` Graph endpoints accepts **either** `Directory.Read.All` or `Domain.Read.All`. This script uses `Directory.Read.All` because it is almost always already admin-consented in enterprise tenants (Teams, Outlook, SharePoint, and most ISV apps depend on it), while `Domain.Read.All` typically requires an explicit, separate admin-consent step. If your tenant has `Domain.Read.All` consented and you prefer least-privilege, edit the `$scopes` array near the top of the script to swap them.
+
+If admin consent for these scopes is not yet granted in the tenant, a Global Administrator (or Privileged Role Administrator) must consent on first run. To verify what is already consented: **Entra admin center** → **Enterprise applications** → **Microsoft Graph Command Line Tools** (App ID `14d82eec-204b-4c2f-b7e8-296a70dab67e`) → **Permissions**.
 
 ### Required Entra ID role
 

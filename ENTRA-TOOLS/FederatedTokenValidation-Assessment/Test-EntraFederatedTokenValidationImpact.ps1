@@ -11,8 +11,9 @@
 .NOTES
     Requires Microsoft Graph PowerShell SDK.
 
-    Minimum useful scopes:
-      Domain.Read.All
+    Minimum useful scopes (either of the first two will satisfy the domain reads):
+      Directory.Read.All  (preferred — usually already admin-consented in restricted tenants)
+      Domain.Read.All     (alternative — requires explicit admin consent in most tenants)
       User.Read.All
 
     Optional for sign-in log review:
@@ -107,7 +108,7 @@ if (-not (Test-Path $OutputDirectory)) {
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 
 $scopes = @(
-    "Domain.Read.All",
+    "Directory.Read.All",
     "User.Read.All"
 )
 
