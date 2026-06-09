@@ -220,7 +220,7 @@ $userProperties = @(
     "onPremisesImmutableId"
 )
 
-$users = Get-MgUser -All -Property ($userProperties -join ",")
+$users = Get-MgUser -All -PageSize 999 -Property ($userProperties -join ",")
 
 Write-Host "Users collected: $($users.Count)"
 
