@@ -532,16 +532,16 @@ $htmlContent = @"
 <body>
     <div class="container">
         <div class="header">
-            <h1>🔐 Conditional Access Policy Report</h1>
+            <h1>Conditional Access Policy Report</h1>
             <p>Generated on $(Get-Date -Format "MMMM dd, yyyy 'at' HH:mm:ss")</p>
         </div>
         
         <div class="tabs">
-            <button class="tab active" onclick="openTab(event, 'summary')">📊 Summary</button>
-            <button class="tab" onclick="openTab(event, 'policies')">🛡️ CA Policies</button>
-            <button class="tab" onclick="openTab(event, 'locations')">📍 Named Locations</button>
-            <button class="tab" onclick="openTab(event, 'appscoping')">🎯 Application Scoping</button>
-            <button class="tab" onclick="openTab(event, 'appmapping')">🔗 App-Policy Mapping</button>
+            <button class="tab active" onclick="openTab(event, 'summary')">Summary</button>
+            <button class="tab" onclick="openTab(event, 'policies')">CA Policies</button>
+            <button class="tab" onclick="openTab(event, 'locations')">Named Locations</button>
+            <button class="tab" onclick="openTab(event, 'appscoping')">Application Scoping</button>
+            <button class="tab" onclick="openTab(event, 'appmapping')">App-Policy Mapping</button>
         </div>
         
         <div id="summary" class="tab-content active">
@@ -571,7 +571,7 @@ $htmlContent = @"
         </div>
         
         <div id="policies" class="tab-content">
-            <input type="text" class="search-box" id="searchPolicies" placeholder="🔍 Search policies..." onkeyup="searchTable('searchPolicies', 'policiesTable')">
+            <input type="text" class="search-box" id="searchPolicies" placeholder="Search policies..." onkeyup="searchTable('searchPolicies', 'policiesTable')">
             <table id="policiesTable">
                 <thead>
                     <tr>
@@ -590,7 +590,7 @@ $htmlContent = @"
         </div>
         
         <div id="locations" class="tab-content">
-            <input type="text" class="search-box" id="searchLocations" placeholder="🔍 Search locations..." onkeyup="searchTable('searchLocations', 'locationsTable')">
+            <input type="text" class="search-box" id="searchLocations" placeholder="Search locations..." onkeyup="searchTable('searchLocations', 'locationsTable')">
             <table id="locationsTable">
                 <thead>
                     <tr>
@@ -608,7 +608,7 @@ $htmlContent = @"
         </div>
         
         <div id="appscoping" class="tab-content">
-            <input type="text" class="search-box" id="searchAppScoping" placeholder="🔍 Search application scoping..." onkeyup="searchTable('searchAppScoping', 'appScopingTable')">
+            <input type="text" class="search-box" id="searchAppScoping" placeholder="Search application scoping..." onkeyup="searchTable('searchAppScoping', 'appScopingTable')">
             <table id="appScopingTable">
                 <thead>
                     <tr>
@@ -625,7 +625,7 @@ $htmlContent = @"
         </div>
         
         <div id="appmapping" class="tab-content">
-            <input type="text" class="search-box" id="searchAppMapping" placeholder="🔍 Search app-policy mapping..." onkeyup="searchTable('searchAppMapping', 'appMappingTable')">
+            <input type="text" class="search-box" id="searchAppMapping" placeholder="Search app-policy mapping..." onkeyup="searchTable('searchAppMapping', 'appMappingTable')">
             <table id="appMappingTable">
                 <thead>
                     <tr>
